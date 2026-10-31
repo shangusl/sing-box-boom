@@ -78,9 +78,36 @@ install_dependencies() {
 # -------------------------------------------------------------
 # 1. 核心下载与初始环境初始化
 # -------------------------------------------------------------
+init_environment() {
+    mkdir -p "${CONF_DIR}"
+    # 初始化空白骨架配置
+    if [[ ! -f "$CONF_FILE" ]]; then
+        cat > "$CONF_FILE" <<EOF
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+    fi
+
+    # 初始化节点元数据文件
+    if [[ ! -f "$NODES_FILE" ]]; then
+        echo "[]" > "$NODES_FILE"
+    fi
+}
+
 download_singbox_core() {
     check_arch
-    mkdir -p "${CONF_DIR}"
+    init_environment
 
     if [[ -f "$BIN_PATH" ]]; then
         return
@@ -585,6 +612,8 @@ apply_inbound_config() {
     local tag="$1"
     local inbound_json="$2"
     local node_meta="$3"
+
+    init_environment
 
     echo -e "${CYAN}[+] 正在将入站规则写入核心配置...${PLAIN}"
     # 移除同名 tag (如果存在)
