@@ -978,7 +978,95 @@ menu_add_node() {
 }
 
 # -------------------------------------------------------------
-# 9. 交互式主菜单 (全面超越 233boy 体验)
+# 9. 一键在线升级模块 (脚本自更新 & 核心版本更新)
+# -------------------------------------------------------------
+update_self() {
+    echo -e "${CYAN}[+] 正在检索 GitHub / CDN 最新脚本版本...${PLAIN}"
+    local cdn_script="https://cdn.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh"
+    local proxy_script="https://ghfast.top/https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
+    local tmp_file="/tmp/sb_latest.sh"
+
+    if curl -fsSL "$cdn_script" -o "$tmp_file" 2>/dev/null || \
+       curl -fsSL "$proxy_script" -o "$tmp_file" 2>/dev/null || \
+       wget -qO "$tmp_file" "$cdn_script" 2>/dev/null || \
+       wget -qO "$tmp_file" "$proxy_script" 2>/dev/null; then
+        
+        # 严格语法校验，避免更新到错误页面
+        if bash -n "$tmp_file" &>/dev/null; then
+            cp -f "$tmp_file" "$SCRIPT_INSTALL_PATH"
+            chmod +x "$SCRIPT_INSTALL_PATH"
+            rm -f "$tmp_file"
+            echo -e "${GREEN}[✓] 管理脚本已成功更新至最新版！所有配置与节点完好保留。${PLAIN}"
+            sleep 1
+            exec "$SCRIPT_INSTALL_PATH"
+        else
+            echo -e "${RED}[错误] 下载到的脚本校验失败，已放弃更新！${PLAIN}"
+            rm -f "$tmp_file"
+        fi
+    else
+        echo -e "${RED}[错误] 网络连接失败，未能获取到最新脚本！${PLAIN}"
+    fi
+}
+
+update_core() {
+    echo -e "${CYAN}[+] 正在检查 sing-box 官方最新发行版...${PLAIN}"
+    local current_ver="未知"
+    if [[ -f "$BIN_PATH" ]]; then
+        current_ver=$("$BIN_PATH" version | head -n 1 | awk '{print $3}')
+    fi
+    echo -e " 当前运行核心版本: ${YELLOW}${current_ver}${PLAIN}"
+
+    local latest_tag
+    latest_tag=$(curl -s4m 5 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null || true)
+    if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
+        echo -e "${RED}[错误] 无法获取 GitHub 最新版本号！${PLAIN}"
+        return
+    fi
+    local version="${latest_tag#v}"
+
+    if [[ "$current_ver" == "$version" || "$current_ver" == "$latest_tag" ]]; then
+        echo -e "${GREEN}[✓] 当前已经是最新核心版本 (${current_ver})，无需升级！${PLAIN}"
+        return
+    fi
+
+    echo -e "${CYAN}[+] 发现新版本: ${GREEN}${latest_tag}${PLAIN}，正在升级...${PLAIN}"
+    check_arch
+    local download_url="https://github.com/SagerNet/sing-box/releases/download/${latest_tag}/sing-box-${version}-linux-${ARCH}.tar.gz"
+    local proxy_url="https://ghfast.top/${download_url}"
+    local tmp_tar="/tmp/sing-box-update.tar.gz"
+
+    wget -qO "$tmp_tar" "$download_url" || curl -fsSL "$download_url" -o "$tmp_tar" || \
+    wget -qO "$tmp_tar" "$proxy_url" || curl -fsSL "$proxy_url" -o "$tmp_tar"
+
+    tar -zxvf "$tmp_tar" -C /tmp/ >/dev/null
+    systemctl stop "${APP_NAME}" 2>/dev/null || true
+    cp -f "/tmp/sing-box-${version}-linux-${ARCH}/sing-box" "$BIN_PATH"
+    chmod +x "$BIN_PATH"
+    rm -rf "/tmp/sing-box"*
+
+    systemctl start "${APP_NAME}" 2>/dev/null || true
+    echo -e "${GREEN}[✓] sing-box 核心升级成功！当前版本: ${latest_tag}${PLAIN}"
+}
+
+update_menu() {
+    echo -e "\n--------------------------------------------------------"
+    echo -e " 请选择更新项:"
+    echo -e " ${GREEN}1.${PLAIN} \033[1;32m更新管理脚本自身\033[0m (保留所有节点与配置，拉取 GitHub 最新特性)"
+    echo -e " ${GREEN}2.${PLAIN} \033[1;36m升级 sing-box 核心\033[0m (更新到官方 GitHub 发布的最新二进制)"
+    echo -e " ${GREEN}0.${PLAIN} 返回上一级"
+    echo -e "--------------------------------------------------------"
+    read -rp "请输入选项 [0-2]: " u_opt
+
+    case "$u_opt" in
+        1) update_self ;;
+        2) update_core ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项！${PLAIN}" ;;
+    esac
+}
+
+# -------------------------------------------------------------
+# 10. 交互式主菜单 (全面超越 233boy 体验)
 # -------------------------------------------------------------
 show_menu() {
     clear
@@ -1013,27 +1101,29 @@ show_menu() {
     echo -e " ${GREEN}2.${PLAIN} 修改现有节点 (修改端口 / 更换SNI / 刷新凭据)"
     echo -e " ${GREEN}3.${PLAIN} 删除现有节点"
     echo -e " ${GREEN}4.${PLAIN} 查看所有节点连接信息 & 二维码"
-    echo -e " ${GREEN}5.${PLAIN} 一键开启系统 BBR 拥塞控制加速"
-    echo -e " ${GREEN}6.${PLAIN} 启动服务"
-    echo -e " ${GREEN}7.${PLAIN} 停止服务"
-    echo -e " ${GREEN}8.${PLAIN} 重启服务"
-    echo -e " ${GREEN}9.${PLAIN} 查看实时运行日志 (tail -f)"
-    echo -e " ${GREEN}10.${PLAIN} 彻底卸载 sing-box"
+    echo -e " ${GREEN}5.${PLAIN} 一键在线更新 (更新脚本自身 / 升级 sing-box 核心)"
+    echo -e " ${GREEN}6.${PLAIN} 一键开启系统 BBR 拥塞控制加速"
+    echo -e " ${GREEN}7.${PLAIN} 启动服务"
+    echo -e " ${GREEN}8.${PLAIN} 停止服务"
+    echo -e " ${GREEN}9.${PLAIN} 重启服务"
+    echo -e " ${GREEN}10.${PLAIN} 查看实时运行日志 (tail -f)"
+    echo -e " ${GREEN}11.${PLAIN} 彻底卸载 sing-box"
     echo -e " ${GREEN}0.${PLAIN} 退出管理"
     echo -e "========================================================"
-    read -rp "请输入选项 [0-10]: " opt
+    read -rp "请输入选项 [0-11]: " opt
 
     case "$opt" in
         1) menu_add_node ;;
         2) modify_node ;;
         3) delete_node ;;
         4) show_all_nodes ;;
-        5) enable_bbr ;;
-        6) systemctl start "${APP_NAME}" && echo -e "${GREEN}服务已启动！${PLAIN}" ;;
-        7) systemctl stop "${APP_NAME}" && echo -e "${YELLOW}服务已停止！${PLAIN}" ;;
-        8) systemctl restart "${APP_NAME}" && echo -e "${GREEN}服务已重启！${PLAIN}" ;;
-        9) journalctl -u "${APP_NAME}" -f -n 50 ;;
-        10)
+        5) update_menu ;;
+        6) enable_bbr ;;
+        7) systemctl start "${APP_NAME}" && echo -e "${GREEN}服务已启动！${PLAIN}" ;;
+        8) systemctl stop "${APP_NAME}" && echo -e "${YELLOW}服务已停止！${PLAIN}" ;;
+        9) systemctl restart "${APP_NAME}" && echo -e "${GREEN}服务已重启！${PLAIN}" ;;
+        10) journalctl -u "${APP_NAME}" -f -n 50 ;;
+        11)
             systemctl stop "${APP_NAME}" 2>/dev/null || true
             systemctl disable "${APP_NAME}" 2>/dev/null || true
             rm -rf "${CONF_DIR}" "${SERVICE_FILE}" "${BIN_PATH}" "${SCRIPT_INSTALL_PATH}"
@@ -1065,13 +1155,16 @@ main() {
             modify|change) modify_node ;;
             del) delete_node ;;
             info|list) show_all_nodes ;;
+            update) update_menu ;;
+            update-sh) update_self ;;
+            update-core) update_core ;;
             bbr) enable_bbr ;;
             start) systemctl start "${APP_NAME}" ;;
             stop) systemctl stop "${APP_NAME}" ;;
             restart) systemctl restart "${APP_NAME}" ;;
             status) systemctl status "${APP_NAME}" ;;
             log) journalctl -u "${APP_NAME}" -f -n 50 ;;
-            *) echo "用法: sb [add|modify|del|info|list|bbr|start|stop|restart|status|log]" ;;
+            *) echo "用法: sb [add|modify|del|info|list|update|bbr|start|stop|restart|status|log]" ;;
         esac
     else
         # 初次安装若无节点，引导添加第一个节点
