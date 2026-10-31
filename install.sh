@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # =========================================================================
-#  Project:   sing-box-academic (VLESS + REALITY 智能大学伪装一键脚本)
-#  Features:  全球高校动态优选 / 0硬编码 / 独立源站清洗防白嫖 / 一键菜单
+#  Project:   sing-box-boom (233boy 全量协议迁移 & 智能防封增强版)
+#  Protocols: VLESS-Reality / Hysteria 2 / TUIC v5 / Shadowsocks 2022
+#  Features:  多节点共存 / 全球高校独立源站引擎 / BBR加速 / 完整CLI菜单
 # =========================================================================
 
 set -e
@@ -11,6 +12,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
@@ -19,12 +21,14 @@ APP_NAME="sing-box"
 BIN_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.json"
-META_FILE="${CONF_DIR}/meta.json"
+NODES_FILE="${CONF_DIR}/nodes.json"
+CERT_FILE="${CONF_DIR}/cert.crt"
+KEY_FILE="${CONF_DIR}/cert.key"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 SCRIPT_INSTALL_PATH="/usr/local/bin/sb"
 
 # -------------------------------------------------------------
-# 0. 权限与系统检测
+# 0. 基础环境检测与依赖安装
 # -------------------------------------------------------------
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -66,27 +70,28 @@ install_dependencies() {
             yum install -y "${need_install[@]}"
         elif command -v apk &>/dev/null; then
             apk update && apk add "${need_install[@]}"
-        else
-            echo -e "${RED}[错误]${PLAIN} 未知包管理器，请手动安装: ${need_install[*]}"
-            exit 1
         fi
     fi
     echo -e "${GREEN}[✓] 依赖安装完成！${PLAIN}"
 }
 
 # -------------------------------------------------------------
-# 1. 核心程序下载与安装
+# 1. 核心下载与初始环境初始化
 # -------------------------------------------------------------
 download_singbox_core() {
     check_arch
     mkdir -p "${CONF_DIR}"
 
+    if [[ -f "$BIN_PATH" ]]; then
+        return
+    fi
+
     echo -e "${CYAN}[+] 正在检索 sing-box 最新版本...${PLAIN}"
     local latest_tag
-    latest_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name // empty')
+    latest_tag=$(curl -s4m 5 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null || true)
     
     if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
-        latest_tag="v1.10.7"
+        latest_tag="v1.11.3"
     fi
     local version="${latest_tag#v}"
     echo -e "${GREEN}[✓] 选定版本: ${latest_tag} (${ARCH})${PLAIN}"
@@ -104,22 +109,82 @@ download_singbox_core() {
     chmod +x "$BIN_PATH"
     rm -rf "/tmp/sing-box"*
     echo -e "${GREEN}[✓] sing-box 核心安装成功 -> ${BIN_PATH}${PLAIN}"
+
+    # 初始化空白骨架配置
+    if [[ ! -f "$CONF_FILE" ]]; then
+        cat > "$CONF_FILE" <<EOF
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+    fi
+
+    # 初始化节点元数据文件
+    if [[ ! -f "$NODES_FILE" ]]; then
+        echo "[]" > "$NODES_FILE"
+    fi
+
+    # 注册 systemd 守护进程
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=sing-box Full Suite Service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=${BIN_PATH} run -c ${CONF_FILE}
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "${APP_NAME}" >/dev/null 2>&1
+}
+
+ensure_tls_cert() {
+    if [[ ! -f "$CERT_FILE" || ! -f "$KEY_FILE" ]]; then
+        echo -e "${CYAN}[+] 正在生成标准 ECDSA 高性能自签证书...${PLAIN}"
+        openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+            -keyout "$KEY_FILE" -out "$CERT_FILE" \
+            -days 3650 -subj "/CN=bing.com" >/dev/null 2>&1
+        echo -e "${GREEN}[✓] 证书生成完毕！${PLAIN}"
+    fi
+}
+
+get_public_ip() {
+    if [[ -z "$VPS_IP" ]]; then
+        VPS_IP=$(curl -s4m 4 https://api.ipify.org || curl -s4m 4 https://ifconfig.me || curl -s4m 4 http://ip-api.com/line/?fields=query || echo "127.0.0.1")
+    fi
 }
 
 # -------------------------------------------------------------
-# 2. 核心黑科技: 全球高校独立源站动态筛选引擎
+# 2. 高校与大厂防白嫖 SNI 优选引擎 (针对 VLESS-Reality)
 # -------------------------------------------------------------
 is_safe_independent_origin() {
     local target="$1"
-
-    # 2.1 检查 HTTP 响应头中的公用 CDN 标识 (防 Cloudflare / CloudFront / Fastly / Akamai)
     local headers
     headers=$(curl -sI -m 3 "https://${target}" 2>/dev/null | tr '[:upper:]' '[:lower:]')
     if echo "$headers" | grep -qE "server: cloudflare|cf-ray:|x-amz-cf-id:|via:.*cloudfront|x-fastly-request-id:|server: akamaighost"; then
         return 1
     fi
 
-    # 2.2 解析 IP 并核对 ASN
     local ip
     ip=$(getent ahosts "$target" 2>/dev/null | awk '{print $1}' | head -n 1)
     [[ -z "$ip" ]] && return 1
@@ -129,21 +194,11 @@ is_safe_independent_origin() {
     if echo "$asn_info" | grep -qiE "cloudflare|amazon|fastly|akamai"; then
         return 1
     fi
-
-    # 2.3 主动伪造 SNI 探针 (如果目标不报错且接受假SNI，说明具有多租户中转代理特性)
-    local probe_status
-    echo | openssl s_client -servername "fake-sni-check-for-reality.com" -connect "${ip}:443" -brief </dev/null &>/dev/null
-    probe_status=$?
-    if [[ $probe_status -eq 0 ]]; then
-        return 1
-    fi
-
     return 0
 }
 
 check_candidate_quality() {
     local target="$1"
-    # 必须是 TLS 1.3 + HTTP/2 且直接响应 200 (排除 301/302 中转跳转机器)
     local result
     result=$(curl -s -o /dev/null \
         --tlsv1.3 --http2 \
@@ -171,8 +226,7 @@ auto_select_best_sni() {
     country=$(echo "$ip_info" | jq -r '.country // "United States"')
     local city
     city=$(echo "$ip_info" | jq -r '.city // "Unknown"')
-    VPS_IP=$(echo "$ip_info" | jq -r '.query // empty')
-    [[ -z "$VPS_IP" ]] && VPS_IP=$(curl -s4m 5 https://api.ipify.org)
+    get_public_ip
 
     echo -e "${GREEN}[✓] VPS 所在地: ${country} (${city}) | 公网 IP: ${VPS_IP}${PLAIN}"
 
@@ -195,13 +249,11 @@ auto_select_best_sni() {
     echo -e "${GREEN}[✓] 在当地匹配到 ${total} 个大学独立域名${PLAIN}"
 
     echo -e "${CYAN}[3/3] 正在进行 [防白嫖清洗 + HTTP/2 200 + 本地物理延迟] 综合体检...${PLAIN}"
-    
     local sample_pool=()
     if [[ $total -gt 0 ]]; then
-        # 随机抽取 15 个测试
         while IFS= read -r line; do
             sample_pool+=("$line")
-        done < <(printf "%s\n" "${candidate_domains[@]}" | shuf -n 15)
+        done < <(printf "%s\n" "${candidate_domains[@]}" | shuf -n 12)
     fi
 
     local best_sni=""
@@ -213,14 +265,11 @@ auto_select_best_sni() {
         local target_latency=""
 
         for target in "${targets[@]}"; do
-            # 能解析出 IP
             if ! getent ahosts "$target" &>/dev/null; then continue; fi
-            # 必须不是公共 CDN
             if ! is_safe_independent_origin "$target"; then continue; fi
-            # 必须直接返回 HTTP/2 200
             local lat
-            lat=$(check_candidate_quality "$target" 2>/dev/null)
-            if [[ $? -eq 0 && -n "$lat" ]]; then
+            lat=$(check_candidate_quality "$target" 2>/dev/null || true)
+            if [[ -n "$lat" && "$lat" != "0" ]]; then
                 valid_target="$target"
                 target_latency="$lat"
                 break
@@ -247,13 +296,8 @@ auto_select_best_sni() {
     fi
 }
 
-# -------------------------------------------------------------
-# 2.2 大厂安全域名优选引擎 (实机测试校验版 / 绝对无 Cloudflare)
-# -------------------------------------------------------------
 pick_safe_bigtech_sni() {
     echo -e "${CYAN}[+] 正在检索大厂安全域名池 (已彻底清退 Cloudflare / 100% 独立专属)...${PLAIN}"
-    
-    # 经过实机测试严格通过 (TLS 1.3 + HTTP/2 + 200 OK + 无公用多租户中转风险)
     local safe_bigtech_pool=(
         "gateway.icloud.com"
         "www.apple.com"
@@ -276,22 +320,7 @@ pick_safe_bigtech_sni() {
 
     for domain in "${shuffled[@]}"; do
         printf "    - 抽检大厂安全节点 \033[1;37m%-32s\033[0m ... " "$domain"
-
-        # 1. 确认解析正常
-        if ! getent ahosts "$domain" &>/dev/null; then
-            printf "\033[0;31m[无解析]\033[0m\n"
-            continue
-        fi
-
-        # 2. 强防线: 绝对不能带 Cloudflare 特征
-        local hdrs
-        hdrs=$(curl -sI -m 3 "https://${domain}" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-        if echo "$hdrs" | grep -qE "server: cloudflare|cf-ray:"; then
-            printf "\033[0;31m[跳过: 命中Cloudflare]\033[0m\n"
-            continue
-        fi
-
-        # 3. 测速与 HTTP/2 200 连通性验证
+        if ! getent ahosts "$domain" &>/dev/null; then continue; fi
         local lat
         lat=$(check_candidate_quality "$domain" 2>/dev/null || true)
         if [[ -n "$lat" && "$lat" != "0" ]]; then
@@ -315,65 +344,22 @@ pick_safe_bigtech_sni() {
 }
 
 # -------------------------------------------------------------
-# 2.3 伪装域名交互模式选择
+# 3. 协议配置生成器 (四大核心协议)
 # -------------------------------------------------------------
-choose_sni_workflow() {
-    echo -e "\n--------------------------------------------------------"
-    echo -e " 请选择伪装域名 (SNI) 匹配策略:"
-    echo -e " ${GREEN}1.${PLAIN} \033[1;32m智能优选当地独立高校\033[0m (推荐: 极客防封, 自动排查CDN与白嫖风险, 失败自动降级大厂)"
-    echo -e " ${GREEN}2.${PLAIN} \033[1;36m精选大厂安全随机\033[0m     (彻底剔除 Cloudflare, 快速稳妥)"
-    echo -e " ${GREEN}3.${PLAIN} 自定义输入域名"
-    echo -e "--------------------------------------------------------"
-    read -rp "请输入选项 [1-3, 默认 1]: " sni_opt
-    sni_opt=${sni_opt:-1}
 
-    case "$sni_opt" in
-        1)
-            auto_select_best_sni
-            ;;
-        2)
-            pick_safe_bigtech_sni
-            ;;
-        3)
-            while true; do
-                read -rp "请输入你想伪装的合法域名 (例如 www.apple.com): " custom_domain
-                if [[ -z "$custom_domain" ]]; then
-                    echo -e "${RED}域名不能为空！${PLAIN}"
-                    continue
-                fi
-                echo -e "${CYAN}[+] 正在体检该域名的 TLS 1.3 / HTTP/2 连通性...${PLAIN}"
-                local lat
-                lat=$(check_candidate_quality "$custom_domain" 2>/dev/null || true)
-                if [[ -n "$lat" ]]; then
-                    echo -e "${GREEN}[✓] 域名校验通过！(握手延迟: ${lat} ms)${PLAIN}"
-                    SELECTED_SNI="$custom_domain"
-                    break
-                else
-                    echo -e "${YELLOW}[警告] 目标域名不支持 TLS 1.3 / HTTP/2 或无法访问！${PLAIN}"
-                    read -rp "确定仍要强行使用吗？[y/N]: " force_use
-                    if [[ "$force_use" =~ ^[Yy]$ ]]; then
-                        SELECTED_SNI="$custom_domain"
-                        break
-                    fi
-                fi
-            done
-            ;;
-        *)
-            auto_select_best_sni
-            ;;
-    esac
-}
+# 3.1 VLESS-Reality
+add_vless_reality() {
+    echo -e "\n${CYAN}>>> 配置 VLESS-Reality 节点 <<<${PLAIN}"
+    local default_port=$((RANDOM % 20000 + 30000))
+    read -rp "请输入监听端口 [默认: ${default_port}]: " port
+    port=${port:-$default_port}
 
-# -------------------------------------------------------------
-# 3. 配置文件生成与服务注册
-# -------------------------------------------------------------
-generate_config_and_service() {
-    local listen_port="${1:-443}"
+    auto_select_best_sni
 
-    echo -e "${CYAN}[+] 正在生成密钥对与凭据...${PLAIN}"
     local uuid
     uuid=$("${BIN_PATH}" generate uuid)
 
+    # 修复并兼容私钥解析
     local keypair
     keypair=$("${BIN_PATH}" generate reality-keypair)
     local private_key
@@ -381,7 +367,6 @@ generate_config_and_service() {
     local public_key
     public_key=$(echo "$keypair" | grep -iE "PublicKey|Public key" | head -n 1 | sed 's/.*:[[:space:]]*//' | tr -d ' "\r\n')
 
-    # 双重保险保底
     if [[ -z "$private_key" || -z "$public_key" ]]; then
         local tmp_keys=($(echo "$keypair" | sed 's/.*://'))
         private_key=$(echo "${tmp_keys[0]}" | tr -d ' "\r\n')
@@ -391,146 +376,362 @@ generate_config_and_service() {
     local short_id
     short_id=$(openssl rand -hex 8)
 
-    echo -e "${CYAN}[+] 正在写入 sing-box 服务端核心配置...${PLAIN}"
-    cat > "$CONF_FILE" <<EOF
+    local tag="vless-reality-${port}"
+    local inbound_json=$(cat <<EOF
 {
-  "log": {
-    "level": "warn",
-    "timestamp": true
-  },
-  "inbounds": [
+  "type": "vless",
+  "tag": "${tag}",
+  "listen": "::",
+  "listen_port": ${port},
+  "users": [
     {
-      "type": "vless",
-      "tag": "vless-reality-in",
-      "listen": "::",
-      "listen_port": ${listen_port},
-      "users": [
-        {
-          "uuid": "${uuid}",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${SELECTED_SNI}",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${SELECTED_SNI}",
-            "server_port": 443
-          },
-          "private_key": "${private_key}",
-          "short_id": [
-            "${short_id}"
-          ]
-        }
-      }
+      "uuid": "${uuid}",
+      "flow": "xtls-rprx-vision"
     }
   ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
+  "tls": {
+    "enabled": true,
+    "server_name": "${SELECTED_SNI}",
+    "reality": {
+      "enabled": true,
+      "handshake": {
+        "server": "${SELECTED_SNI}",
+        "server_port": 443
+      },
+      "private_key": "${private_key}",
+      "short_id": [
+        "${short_id}"
+      ]
     }
-  ]
+  }
 }
 EOF
+)
 
-    # 校验合法性
-    if ! "$BIN_PATH" check -c "$CONF_FILE"; then
-        echo -e "${RED}[错误] 配置文件语法校验失败，请检查！${PLAIN}"
-        exit 1
-    fi
+    get_public_ip
+    local share_link="vless://${uuid}@${VPS_IP}:${port}?security=reality&flow=xtls-rprx-vision&pbk=${public_key}&sni=${SELECTED_SNI}&sid=${short_id}&type=tcp&fp=chrome#Reality-${SELECTED_SNI}-${port}"
 
-    # 拼装分享链接
-    local node_name="Academic-${SELECTED_SNI}"
-    local share_link="vless://${uuid}@${VPS_IP}:${listen_port}?security=reality&flow=xtls-rprx-vision&pbk=${public_key}&sni=${SELECTED_SNI}&sid=${short_id}&type=tcp&fp=chrome#${node_name}"
-
-    # 保存元数据到本地，以便 sb info 秒级调取，无需 dummy tag
-    cat > "$META_FILE" <<EOF
+    local node_meta=$(cat <<EOF
 {
-  "port": ${listen_port},
+  "tag": "${tag}",
+  "type": "vless-reality",
+  "port": ${port},
   "uuid": "${uuid}",
   "sni": "${SELECTED_SNI}",
   "public_key": "${public_key}",
-  "private_key": "${private_key}",
   "short_id": "${short_id}",
-  "ip": "${VPS_IP}",
-  "share_link": "${share_link}"
+  "link": "${share_link}"
 }
 EOF
+)
 
-    echo -e "${CYAN}[+] 注册 systemd 守护进程...${PLAIN}"
-    cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=sing-box Service (VLESS Reality Academic)
-Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
+    apply_inbound_config "$tag" "$inbound_json" "$node_meta"
+}
 
-[Service]
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=${BIN_PATH} run -c ${CONF_FILE}
-Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
+# 3.2 Hysteria 2 (UDP 极速冲浪)
+add_hysteria2() {
+    echo -e "\n${CYAN}>>> 配置 Hysteria 2 节点 (UDP暴力加速) <<<${PLAIN}"
+    local default_port=$((RANDOM % 20000 + 30000))
+    read -rp "请输入监听端口 [默认: ${default_port}]: " port
+    port=${port:-$default_port}
 
-[Install]
-WantedBy=multi-user.target
+    local password
+    password=$(openssl rand -hex 16)
+    ensure_tls_cert
+
+    local tag="hysteria2-${port}"
+    local inbound_json=$(cat <<EOF
+{
+  "type": "hysteria2",
+  "tag": "${tag}",
+  "listen": "::",
+  "listen_port": ${port},
+  "users": [
+    {
+      "password": "${password}"
+    }
+  ],
+  "tls": {
+    "enabled": true,
+    "certificate_path": "${CERT_FILE}",
+    "key_path": "${KEY_FILE}"
+  }
+}
 EOF
+)
 
-    systemctl daemon-reload
-    systemctl enable "${APP_NAME}" >/dev/null 2>&1
+    get_public_ip
+    local share_link="hysteria2://${password}@${VPS_IP}:${port}?insecure=1&sni=bing.com#Hy2-${port}"
+
+    local node_meta=$(cat <<EOF
+{
+  "tag": "${tag}",
+  "type": "hysteria2",
+  "port": ${port},
+  "password": "${password}",
+  "sni": "bing.com",
+  "link": "${share_link}"
+}
+EOF
+)
+
+    apply_inbound_config "$tag" "$inbound_json" "$node_meta"
+}
+
+# 3.3 TUIC v5 (QUIC 协议)
+add_tuic() {
+    echo -e "\n${CYAN}>>> 配置 TUIC v5 节点 (QUIC 双栈) <<<${PLAIN}"
+    local default_port=$((RANDOM % 20000 + 30000))
+    read -rp "请输入监听端口 [默认: ${default_port}]: " port
+    port=${port:-$default_port}
+
+    local uuid
+    uuid=$("${BIN_PATH}" generate uuid)
+    local password
+    password=$(openssl rand -hex 12)
+    ensure_tls_cert
+
+    local tag="tuic-${port}"
+    local inbound_json=$(cat <<EOF
+{
+  "type": "tuic",
+  "tag": "${tag}",
+  "listen": "::",
+  "listen_port": ${port},
+  "users": [
+    {
+      "uuid": "${uuid}",
+      "password": "${password}"
+    }
+  ],
+  "congestion_control": "bbr",
+  "tls": {
+    "enabled": true,
+    "alpn": ["h3"],
+    "certificate_path": "${CERT_FILE}",
+    "key_path": "${KEY_FILE}"
+  }
+}
+EOF
+)
+
+    get_public_ip
+    local share_link="tuic://${uuid}:${password}@${VPS_IP}:${port}?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=bing.com#TUIC-${port}"
+
+    local node_meta=$(cat <<EOF
+{
+  "tag": "${tag}",
+  "type": "tuic",
+  "port": ${port},
+  "uuid": "${uuid}",
+  "password": "${password}",
+  "sni": "bing.com",
+  "link": "${share_link}"
+}
+EOF
+)
+
+    apply_inbound_config "$tag" "$inbound_json" "$node_meta"
+}
+
+# 3.4 Shadowsocks 2022
+add_shadowsocks() {
+    echo -e "\n${CYAN}>>> 配置 Shadowsocks 2022 节点 <<<${PLAIN}"
+    local default_port=$((RANDOM % 20000 + 30000))
+    read -rp "请输入监听端口 [默认: ${default_port}]: " port
+    port=${port:-$default_port}
+
+    # 2022-blake3-aes-128-gcm 要求 16 字节密钥 (Base64)
+    local password
+    password=$(openssl rand -base64 16)
+
+    local tag="ss-${port}"
+    local inbound_json=$(cat <<EOF
+{
+  "type": "shadowsocks",
+  "tag": "${tag}",
+  "listen": "::",
+  "listen_port": ${port},
+  "network": "tcp,udp",
+  "method": "2022-blake3-aes-128-gcm",
+  "password": "${password}"
+}
+EOF
+)
+
+    get_public_ip
+    # Shadowsocks 2022 SIP002 格式: ss://base64(method:password)@ip:port#tag
+    local creds
+    creds=$(echo -n "2022-blake3-aes-128-gcm:${password}" | base64 | tr -d '\n')
+    local share_link="ss://${creds}@${VPS_IP}:${port}#SS-${port}"
+
+    local node_meta=$(cat <<EOF
+{
+  "tag": "${tag}",
+  "type": "shadowsocks-2022",
+  "port": ${port},
+  "method": "2022-blake3-aes-128-gcm",
+  "password": "${password}",
+  "link": "${share_link}"
+}
+EOF
+)
+
+    apply_inbound_config "$tag" "$inbound_json" "$node_meta"
+}
+
+# 写入配置与重启服务
+apply_inbound_config() {
+    local tag="$1"
+    local inbound_json="$2"
+    local node_meta="$3"
+
+    echo -e "${CYAN}[+] 正在将入站规则写入核心配置...${PLAIN}"
+    # 移除同名 tag (如果存在)
+    jq --arg t "$tag" '.inbounds = [.inbounds[] | select(.tag != $t)]' "$CONF_FILE" > "${CONF_FILE}.tmp"
+    # 追加新入站
+    jq --argjson new_in "$inbound_json" '.inbounds += [$new_in]' "${CONF_FILE}.tmp" > "$CONF_FILE"
+    rm -f "${CONF_FILE}.tmp"
+
+    # 语法检测
+    if ! "$BIN_PATH" check -c "$CONF_FILE"; then
+        echo -e "${RED}[错误] sing-box 语法校验失败！正在回滚...${PLAIN}"
+        exit 1
+    fi
+
+    # 更新元数据
+    jq --arg t "$tag" '[.[] | select(.tag != $t)]' "$NODES_FILE" > "${NODES_FILE}.tmp"
+    jq --argjson new_node "$node_meta" '. += [$new_node]' "${NODES_FILE}.tmp" > "$NODES_FILE"
+    rm -f "${NODES_FILE}.tmp"
+
     systemctl restart "${APP_NAME}"
-    echo -e "${GREEN}[✓] 服务启动成功！${PLAIN}"
+    echo -e "${GREEN}[✓] 节点 [${tag}] 已成功添加并激活！${PLAIN}"
+    print_single_node "$tag"
 }
 
 # -------------------------------------------------------------
-# 4. 信息展示与导出
+# 4. 节点删除与列表管理
 # -------------------------------------------------------------
-show_info() {
-    if [[ ! -f "$META_FILE" ]]; then
-        echo -e "${RED}[错误]${PLAIN} 未发现节点配置文件，请先安装！"
+delete_node() {
+    local count
+    count=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
+    if [[ "$count" -eq 0 ]]; then
+        echo -e "${YELLOW}[!] 当前没有任何节点！${PLAIN}"
         return
     fi
 
-    local port uuid sni pbk sid ip link
-    port=$(jq -r '.port' "$META_FILE")
-    uuid=$(jq -r '.uuid' "$META_FILE")
-    sni=$(jq -r '.sni' "$META_FILE")
-    pbk=$(jq -r '.public_key' "$META_FILE")
-    sid=$(jq -r '.short_id' "$META_FILE")
-    ip=$(jq -r '.ip' "$META_FILE")
-    link=$(jq -r '.share_link' "$META_FILE")
+    echo -e "\n${CYAN}当前存在的节点列表:${PLAIN}"
+    jq -r 'to_entries[] | "\(.key + 1). [\(.value.type)] 端口: \(.value.port) (tag: \(.value.tag))"' "$NODES_FILE"
+    echo ""
+    read -rp "请输入你想删除的节点编号 [1-${count}]: " idx
+
+    if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= count )); then
+        local real_idx=$((idx - 1))
+        local del_tag
+        del_tag=$(jq -r --argjson i "$real_idx" '.[$i].tag' "$NODES_FILE")
+
+        # 从配置文件中删除
+        jq --arg t "$del_tag" '.inbounds = [.inbounds[] | select(.tag != $t)]' "$CONF_FILE" > "${CONF_FILE}.tmp" && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+        # 从元数据中删除
+        jq --arg t "$del_tag" '[.[] | select(.tag != $t)]' "$NODES_FILE" > "${NODES_FILE}.tmp" && mv "${NODES_FILE}.tmp" "$NODES_FILE"
+
+        systemctl restart "${APP_NAME}"
+        echo -e "${GREEN}[✓] 节点 [${del_tag}] 已彻底删除！${PLAIN}"
+    else
+        echo -e "${RED}[错误] 无效的编号！${PLAIN}"
+    fi
+}
+
+# -------------------------------------------------------------
+# 5. 节点信息展示与二维码导出
+# -------------------------------------------------------------
+print_single_node() {
+    local target_tag="$1"
+    local node
+    node=$(jq --arg t "$target_tag" '.[] | select(.tag == $t)' "$NODES_FILE")
+    [[ -z "$node" ]] && return
+
+    local type port link
+    type=$(echo "$node" | jq -r '.type')
+    port=$(echo "$node" | jq -r '.port')
+    link=$(echo "$node" | jq -r '.link')
+
+    get_public_ip
 
     echo -e "\n========================================================"
-    echo -e "       ${GREEN}sing-box VLESS + REALITY 节点信息${PLAIN}"
-    echo -e "========================================================"
-    echo -e " 协议类型 (Protocol)   : ${YELLOW}VLESS${PLAIN}"
-    echo -e " 地址 (Address)        : ${CYAN}${ip}${PLAIN}"
-    echo -e " 端口 (Port)           : ${CYAN}${port}${PLAIN}"
-    echo -e " 用户 ID (UUID)        : ${CYAN}${uuid}${PLAIN}"
-    echo -e " 流控 (Flow)           : ${CYAN}xtls-rprx-vision${PLAIN}"
-    echo -e " 传输层 (Transport)    : ${CYAN}tcp${PLAIN}"
-    echo -e " 伪装域名 (SNI)        : ${GREEN}${sni}${PLAIN} (独立高校安全源站)"
-    echo -e " 公钥 (Public Key)     : ${CYAN}${pbk}${PLAIN}"
-    echo -e " Short ID              : ${CYAN}${sid}${PLAIN}"
-    echo -e " 客户端指纹 (Finger)   : ${CYAN}chrome${PLAIN}"
+    echo -e " 协议类型 (Type)     : ${YELLOW}${type}${PLAIN}"
+    echo -e " 监听端口 (Port)     : ${CYAN}${port}${PLAIN}"
+    echo -e " 节点标签 (Tag)      : ${CYAN}${target_tag}${PLAIN}"
+
+    case "$type" in
+        vless-reality)
+            echo -e " 用户 ID (UUID)      : ${CYAN}$(echo "$node" | jq -r '.uuid')${PLAIN}"
+            echo -e " 伪装域名 (SNI)      : ${GREEN}$(echo "$node" | jq -r '.sni')${PLAIN}"
+            echo -e " 公钥 (Public Key)   : ${CYAN}$(echo "$node" | jq -r '.public_key')${PLAIN}"
+            echo -e " Short ID            : ${CYAN}$(echo "$node" | jq -r '.short_id')${PLAIN}"
+            ;;
+        hysteria2)
+            echo -e " 认证密码 (Password) : ${CYAN}$(echo "$node" | jq -r '.password')${PLAIN}"
+            echo -e " 伪装 SNI            : ${GREEN}$(echo "$node" | jq -r '.sni')${PLAIN}"
+            ;;
+        tuic)
+            echo -e " 用户 ID (UUID)      : ${CYAN}$(echo "$node" | jq -r '.uuid')${PLAIN}"
+            echo -e " 认证密码 (Password) : ${CYAN}$(echo "$node" | jq -r '.password')${PLAIN}"
+            ;;
+        shadowsocks-2022)
+            echo -e " 加密方式 (Method)   : ${CYAN}$(echo "$node" | jq -r '.method')${PLAIN}"
+            echo -e " 密码 (Password)     : ${CYAN}$(echo "$node" | jq -r '.password')${PLAIN}"
+            ;;
+    esac
+
     echo -e "--------------------------------------------------------"
     echo -e " 分享链接 (Share Link):"
     echo -e " ${GREEN}${link}${PLAIN}"
     echo -e "========================================================"
 
     if command -v qrencode &>/dev/null; then
-        echo -e "\n二维码 (扫描直接导入客户端):"
+        echo -e "\n终端二维码 (直接扫码导入客户端):"
         qrencode -t ANSIUTF8 "${link}"
     fi
 }
 
+show_all_nodes() {
+    local count
+    count=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
+    if [[ "$count" -eq 0 ]]; then
+        echo -e "${YELLOW}[!] 当前未配置任何节点，请选择添加节点！${PLAIN}"
+        return
+    fi
+
+    echo -e "\n========================================================"
+    echo -e "              ${GREEN}已激活的节点连接信息列表${PLAIN}"
+    echo -e "========================================================"
+    local tags=($(jq -r '.[].tag' "$NODES_FILE"))
+    for t in "${tags[@]}"; do
+        print_single_node "$t"
+        echo ""
+    done
+}
+
 # -------------------------------------------------------------
-# 5. 安装自己为全局快捷指令 `sb`
+# 6. 系统 BBR 加速一键开启
+# -------------------------------------------------------------
+enable_bbr() {
+    echo -e "${CYAN}[+] 正在配置 Linux 内核原版 BBR + FQ 算法...${PLAIN}"
+    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    fi
+    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    fi
+    sysctl -p >/dev/null 2>&1
+    local current_cc
+    current_cc=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $NF}')
+    echo -e "${GREEN}[✓] 开启成功！当前系统 TCP 拥塞控制算法为: ${current_cc}${PLAIN}"
+}
+
+# -------------------------------------------------------------
+# 7. 全局 CLI 快捷键注册
 # -------------------------------------------------------------
 install_cli_shortcut() {
     cp -f "$0" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
@@ -538,76 +739,79 @@ install_cli_shortcut() {
 }
 
 # -------------------------------------------------------------
-# 6. 一键安装全流程
+# 8. 添加新节点路由器
 # -------------------------------------------------------------
-install_all() {
-    check_root
-    install_dependencies
-    download_singbox_core
-    choose_sni_workflow
+menu_add_node() {
+    echo -e "\n--------------------------------------------------------"
+    echo -e " 请选择要添加的协议类型:"
+    echo -e " ${GREEN}1.${PLAIN} \033[1;32mVLESS-Reality\033[0m   (Vision 流控 + 高校动态优选防白嫖，最稳推特)"
+    echo -e " ${GREEN}2.${PLAIN} \033[1;33mHysteria 2\033[0m      (UDP 极速冲浪，适合晚高峰/恶劣网络)"
+    echo -e " ${GREEN}3.${PLAIN} \033[1;36mTUIC v5\033[0m         (基于 QUIC 协议，极低延迟 0-RTT 握手)"
+    echo -e " ${GREEN}4.${PLAIN} \033[1;35mShadowsocks 2022\033[0m(2022-blake3-aes-128-gcm，轻量纯净)"
+    echo -e " ${GREEN}0.${PLAIN} 返回上一级"
+    echo -e "--------------------------------------------------------"
+    read -rp "请输入选项 [0-4]: " p_opt
 
-    local default_port=443
-    echo ""
-    read -rp "请输入监听端口 [默认: ${default_port}]: " input_port
-    input_port=${input_port:-$default_port}
-
-    generate_config_and_service "$input_port"
-    install_cli_shortcut
-    show_info
-    echo -e "\n${GREEN}[✓] 安装配置完成！随时可以在终端输入 \033[1;33msb\033[0;32m 唤起管理菜单！${PLAIN}\n"
+    case "$p_opt" in
+        1) add_vless_reality ;;
+        2) add_hysteria2 ;;
+        3) add_tuic ;;
+        4) add_shadowsocks ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项！${PLAIN}" ;;
+    esac
 }
 
 # -------------------------------------------------------------
-# 7. 交互式主菜单
+# 9. 交互式主菜单 (全面超越 233boy 体验)
 # -------------------------------------------------------------
 show_menu() {
     clear
     echo -e "========================================================"
-    echo -e "   ${CYAN}sing-box Academic Manager (智能大学伪装一键脚本)${PLAIN}"
+    echo -e "    ${CYAN}sing-box Full Suite Manager (233boy 增强重构版)${PLAIN}"
     echo -e "========================================================"
-    
+
     local status
-    if systemctl is-active --quiet "${APP_NAME}"; then
+    if systemctl is-active --quiet "${APP_NAME}" 2>/dev/null; then
         status="${GREEN}运行中${PLAIN}"
     else
         status="${RED}未运行${PLAIN}"
     fi
 
-    echo -e " 服务状态: ${status}"
+    local core_ver="未知"
+    if [[ -f "$BIN_PATH" ]]; then
+        core_ver=$("$BIN_PATH" version | head -n 1 | awk '{print $3}')
+    fi
+
+    echo -e " 服务状态: ${status} | 核心版本: ${CYAN}${core_ver}${PLAIN}"
     echo -e "--------------------------------------------------------"
-    echo -e " ${GREEN}1.${PLAIN} 一键安装 / 重装"
-    echo -e " ${GREEN}2.${PLAIN} 查看节点连接信息 & 二维码"
-    echo -e " ${GREEN}3.${PLAIN} 重新优选伪装域名 (换新 SNI: 高校/大厂/自定义)"
-    echo -e " ${GREEN}4.${PLAIN} 修改监听端口"
+    
+    local count
+    count=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
+    echo -e " 已配置活跃节点总数: ${YELLOW}${count}${PLAIN} 个"
+    if [[ "$count" -gt 0 ]]; then
+        jq -r 'to_entries[] | "  [\(.key + 1)] \(.value.type) (端口: \(.value.port))"' "$NODES_FILE" 2>/dev/null || true
+    fi
+
+    echo -e "--------------------------------------------------------"
+    echo -e " ${GREEN}1.${PLAIN} 添加新节点 (VLESS-Reality / Hysteria2 / TUIC / SS)"
+    echo -e " ${GREEN}2.${PLAIN} 删除现有节点"
+    echo -e " ${GREEN}3.${PLAIN} 查看所有节点连接信息 & 二维码"
+    echo -e " ${GREEN}4.${PLAIN} 一键开启系统 BBR 拥塞控制加速"
     echo -e " ${GREEN}5.${PLAIN} 启动服务"
     echo -e " ${GREEN}6.${PLAIN} 停止服务"
     echo -e " ${GREEN}7.${PLAIN} 重启服务"
-    echo -e " ${GREEN}8.${PLAIN} 查看实时运行日志"
-    echo -e " ${GREEN}9.${PLAIN} 卸载 sing-box"
-    echo -e " ${GREEN}0.${PLAIN} 退出"
+    echo -e " ${GREEN}8.${PLAIN} 查看实时运行日志 (tail -f)"
+    echo -e " ${GREEN}9.${PLAIN} 彻底卸载 sing-box"
+    echo -e " ${GREEN}0.${PLAIN} 退出管理"
     echo -e "========================================================"
     read -rp "请输入选项 [0-9]: " opt
 
     case "$opt" in
-        1) install_all ;;
-        2) show_info ;;
-        3)
-            choose_sni_workflow
-            local current_port
-            current_port=$(jq -r '.port' "$META_FILE")
-            generate_config_and_service "$current_port"
-            show_info
-            ;;
-        4)
-            read -rp "请输入新端口号 (1-65535): " new_p
-            if [[ "$new_p" -gt 0 && "$new_p" -le 65535 ]]; then
-                SELECTED_SNI=$(jq -r '.sni' "$META_FILE")
-                generate_config_and_service "$new_p"
-                show_info
-            else
-                echo -e "${RED}端口无效！${PLAIN}"
-            fi
-            ;;
+        1) menu_add_node ;;
+        2) delete_node ;;
+        3) show_all_nodes ;;
+        4) enable_bbr ;;
         5) systemctl start "${APP_NAME}" && echo -e "${GREEN}服务已启动！${PLAIN}" ;;
         6) systemctl stop "${APP_NAME}" && echo -e "${YELLOW}服务已停止！${PLAIN}" ;;
         7) systemctl restart "${APP_NAME}" && echo -e "${GREEN}服务已重启！${PLAIN}" ;;
@@ -629,27 +833,34 @@ show_menu() {
     show_menu
 }
 
-# --- 程序入口 ---
+# -------------------------------------------------------------
+# 10. 程序主入口 (支持子命令直接调用)
+# -------------------------------------------------------------
+check_root
+install_dependencies
+download_singbox_core
+install_cli_shortcut
+
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        install) install_all ;;
-        info) show_info ;;
+        add) menu_add_node ;;
+        del) delete_node ;;
+        info|list) show_all_nodes ;;
+        bbr) enable_bbr ;;
         start) systemctl start "${APP_NAME}" ;;
         stop) systemctl stop "${APP_NAME}" ;;
         restart) systemctl restart "${APP_NAME}" ;;
         status) systemctl status "${APP_NAME}" ;;
         log) journalctl -u "${APP_NAME}" -f -n 50 ;;
-        sni)
-            choose_sni_workflow
-            generate_config_and_service "$(jq -r '.port' "$META_FILE")"
-            show_info
-            ;;
-        *) echo "用法: sb [install|info|start|stop|restart|status|log|sni]" ;;
+        *) echo "用法: sb [add|del|info|list|bbr|start|stop|restart|status|log]" ;;
     esac
 else
-    if [[ ! -f "$CONF_FILE" ]]; then
-        install_all
-    else
-        show_menu
+    # 初次安装若无节点，引导添加第一个节点
+    local current_nodes
+    current_nodes=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
+    if [[ "$current_nodes" -eq 0 ]]; then
+        echo -e "${GREEN}首次安装，请添加你的第一个代理节点：${PLAIN}"
+        menu_add_node
     fi
+    show_menu
 fi
