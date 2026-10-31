@@ -1170,6 +1170,12 @@ enable_bbr() {
 # 7. 全局 CLI 快捷键注册
 # -------------------------------------------------------------
 install_cli_shortcut() {
+    # 若存在 233boy 原版脚本，自动安全备份为 sb-233，双向保留
+    if [[ -f "$SCRIPT_INSTALL_PATH" ]] && ! grep -q "sing-box-boom" "$SCRIPT_INSTALL_PATH" 2>/dev/null; then
+        cp -f "$SCRIPT_INSTALL_PATH" "/usr/local/bin/sb-233" 2>/dev/null || true
+        chmod +x "/usr/local/bin/sb-233" 2>/dev/null || true
+    fi
+
     local install_targets=("$SCRIPT_INSTALL_PATH" "$SCRIPT_ALT_PATH")
     for target in "${install_targets[@]}"; do
         if [[ ! -f "$0" || "$0" == /dev/fd/* || "$0" == /proc/* || "$0" == "bash" ]]; then
