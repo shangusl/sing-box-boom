@@ -103,6 +103,29 @@ EOF
     if [[ ! -f "$NODES_FILE" ]]; then
         echo "[]" > "$NODES_FILE"
     fi
+
+    sync_and_clean_inbounds
+}
+
+sync_and_clean_inbounds() {
+    [[ ! -f "$CONF_FILE" || ! -f "$NODES_FILE" ]] && return 0
+    local count
+    count=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
+    if [[ "$count" -gt 0 ]]; then
+        local valid_tags
+        valid_tags=$(jq -c '[.[].tag]' "$NODES_FILE" 2>/dev/null)
+        if [[ -n "$valid_tags" && "$valid_tags" != "[]" ]]; then
+            jq --argjson tags "$valid_tags" \
+               '.inbounds = [.inbounds[] | select(.tag as $t | $tags | index($t))]' \
+               "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+        fi
+    else
+        jq '.inbounds = []' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+    fi
+
+    # 保证 listen_port 严格去重 (同一端口绝不允许多个 inbound 重叠绑定)
+    jq '.inbounds = ([.inbounds | reverse | unique_by(.listen_port) | reverse])' \
+       "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
 }
 
 download_singbox_core() {
@@ -669,11 +692,14 @@ apply_inbound_config() {
     init_environment
 
     echo -e "${CYAN}[+] 正在将入站规则写入核心配置...${PLAIN}"
-    # 移除同名 tag (如果存在)
-    jq --arg t "$tag" '.inbounds = [.inbounds[] | select(.tag != $t)]' "$CONF_FILE" > "${CONF_FILE}.tmp"
+    # 移除同名 tag 或相同端口的旧入站
+    jq --arg t "$tag" --argjson p "$p" '.inbounds = [.inbounds[] | select(.tag != $t and .listen_port != $p)]' "$CONF_FILE" > "${CONF_FILE}.tmp"
     # 追加新入站
     jq --argjson new_in "$inbound_json" '.inbounds += [$new_in]' "${CONF_FILE}.tmp" > "$CONF_FILE"
     rm -f "${CONF_FILE}.tmp"
+
+    # 严格清理并去重
+    sync_and_clean_inbounds
 
     # 语法检测
     if ! "$BIN_PATH" check -c "$CONF_FILE"; then
@@ -682,9 +708,13 @@ apply_inbound_config() {
     fi
 
     # 更新元数据
-    jq --arg t "$tag" '[.[] | select(.tag != $t)]' "$NODES_FILE" > "${NODES_FILE}.tmp"
+    jq --arg t "$tag" --argjson p "$p" '[.[] | select(.tag != $t and .port != $p)]' "$NODES_FILE" > "${NODES_FILE}.tmp"
     jq --argjson new_node "$node_meta" '. += [$new_node]' "${NODES_FILE}.tmp" > "$NODES_FILE"
     rm -f "${NODES_FILE}.tmp"
+
+    # 释放可能占用该端口的历史残留孤儿进程
+    fuser -k "${p}/tcp" 2>/dev/null || true
+    fuser -k "${p}/udp" 2>/dev/null || true
 
     # 自动放行防火墙端口与开机自启动
     open_port "$p"
@@ -1086,6 +1116,7 @@ update_menu() {
 # -------------------------------------------------------------
 show_menu() {
     clear
+    sync_and_clean_inbounds
     echo -e "========================================================"
     echo -e "    ${CYAN}sing-box Full Suite Manager (233boy 增强重构版)${PLAIN}"
     echo -e "========================================================"
@@ -1135,9 +1166,17 @@ show_menu() {
         4) show_all_nodes ;;
         5) update_menu ;;
         6) enable_bbr ;;
-        7) systemctl start "${APP_NAME}" && echo -e "${GREEN}服务已启动！${PLAIN}" ;;
-        8) systemctl stop "${APP_NAME}" && echo -e "${YELLOW}服务已停止！${PLAIN}" ;;
-        9) systemctl restart "${APP_NAME}" && echo -e "${GREEN}服务已重启！${PLAIN}" ;;
+        7) 
+            sync_and_clean_inbounds
+            systemctl start "${APP_NAME}" && echo -e "${GREEN}服务已启动！${PLAIN}" 
+            ;;
+        8) 
+            systemctl stop "${APP_NAME}" && echo -e "${YELLOW}服务已停止！${PLAIN}" 
+            ;;
+        9) 
+            sync_and_clean_inbounds
+            systemctl restart "${APP_NAME}" && echo -e "${GREEN}服务已重启！${PLAIN}" 
+            ;;
         10) journalctl -u "${APP_NAME}" -f -n 50 ;;
         11)
             systemctl stop "${APP_NAME}" 2>/dev/null || true
@@ -1164,6 +1203,7 @@ main() {
     install_dependencies
     download_singbox_core
     install_cli_shortcut
+    sync_and_clean_inbounds
 
     if [[ $# -gt 0 ]]; then
         case "$1" in
