@@ -77,7 +77,7 @@ test_single_domain() {
     # 1. 检查连通性、HTTP 响应与 CDN 头部
     local curl_header_file="/tmp/sni_hdr_$$.tmp"
     local http_code
-    http_code=$(curl -sI -m 4 --connect-timeout 3 "https://${domain}" -D "$curl_header_file" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+    http_code=$(curl -sI -m 3 --connect-timeout 2 "https://${domain}" -D "$curl_header_file" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
     
     if [[ "$http_code" == "000" ]]; then
         rm -f "$curl_header_file"
@@ -108,8 +108,12 @@ test_single_domain() {
     local openssl_out
     start_ts=$(date +%s%3N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || echo 0)
     
-    # 模拟真实客户端进行 TLS 1.3 + ALPN (h2) 协商
-    openssl_out=$(echo -n "" | openssl s_client -tls1_3 -alpn h2,http/1.1 -connect "${domain}:443" -servername "${domain}" 2>&1 || true)
+    # 模拟真实客户端进行 TLS 1.3 + ALPN (h2) 协商 (设置 2.5s 硬超时防卡死)
+    if command -v timeout &>/dev/null; then
+        openssl_out=$(timeout 2.5 openssl s_client -tls1_3 -alpn h2,http/1.1 -connect "${domain}:443" -servername "${domain}" </dev/null 2>&1 || true)
+    else
+        openssl_out=$(echo -n "" | openssl s_client -tls1_3 -alpn h2,http/1.1 -connect "${domain}:443" -servername "${domain}" 2>&1 || true)
+    fi
     
     end_ts=$(date +%s%3N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || echo 0)
     if [[ "$start_ts" -gt 0 && "$end_ts" -gt 0 && "$end_ts" -ge "$start_ts" ]]; then
@@ -172,6 +176,14 @@ scan_local_universities() {
         )
     else
         echo -e "${GREEN}[✓] 在当地成功匹配到 ${#domains[@]} 个大学独立域名！${PLAIN}"
+        if [[ ${#domains[@]} -gt 25 ]]; then
+            if command -v shuf &>/dev/null; then
+                domains=($(printf "%s\n" "${domains[@]}" | shuf -n 25))
+            else
+                domains=("${domains[@]:0:25}")
+            fi
+            echo -e "${CYAN}[i] 机构库规模庞大，已智能随机精选 25 所代表性大学进行极速体检 (达标即停)...${PLAIN}"
+        fi
     fi
 
     run_batch_test "${domains[@]}"
@@ -245,10 +257,18 @@ run_batch_test() {
         # 收集优质候选
         if [[ "$tls13" == "是" && "$cdn" == "独立源站" && "$code" =~ ^(200|301|302|304|307|308)$ ]]; then
             qualified_results+=("${rtt}|${d}|${h2}|${code}")
+            # 若已捕获 3 个极速五星源站，提前收工无需傻等
+            if [[ "$h2" == "是" && ${#qualified_results[@]} -ge 3 ]]; then
+                echo -e "--------------------------------------------------------------------------------------------------------"
+                echo -e "${GREEN}[✓] 已成功捕获 3 个五星极品独立源站，无需继续等待，自动提前完成！${PLAIN}"
+                break
+            fi
         fi
     done
 
-    echo -e "--------------------------------------------------------------------------------------------------------"
+    if [[ ${#qualified_results[@]} -lt 3 ]]; then
+        echo -e "--------------------------------------------------------------------------------------------------------"
+    fi
     
     # 汇总最佳推荐
     if [[ ${#qualified_results[@]} -gt 0 ]]; then
