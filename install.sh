@@ -1113,11 +1113,13 @@ enable_bbr() {
 # -------------------------------------------------------------
 install_cli_shortcut() {
     if [[ ! -f "$0" || "$0" == /dev/fd/* || "$0" == /proc/* || "$0" == "bash" ]]; then
-        local cdn_script="https://cdn.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh"
+        local github_raw="https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
         local proxy_script="https://ghfast.top/https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
-        curl -fsSL "$cdn_script" -o "$SCRIPT_INSTALL_PATH" 2>/dev/null || \
+        local cdn_script="https://cdn.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh"
+        curl -fsSL "$github_raw" -o "$SCRIPT_INSTALL_PATH" 2>/dev/null || \
         curl -fsSL "$proxy_script" -o "$SCRIPT_INSTALL_PATH" 2>/dev/null || \
-        wget -qO "$SCRIPT_INSTALL_PATH" "$cdn_script" 2>/dev/null || \
+        curl -fsSL "$cdn_script" -o "$SCRIPT_INSTALL_PATH" 2>/dev/null || \
+        wget -qO "$SCRIPT_INSTALL_PATH" "$github_raw" 2>/dev/null || \
         wget -qO "$SCRIPT_INSTALL_PATH" "$proxy_script" 2>/dev/null || true
     else
         cp -f "$0" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
@@ -1153,14 +1155,16 @@ menu_add_node() {
 # 9. 一键在线升级模块 (脚本自更新 & 核心版本更新)
 # -------------------------------------------------------------
 update_self() {
-    echo -e "${CYAN}[+] 正在检索 GitHub / CDN 最新脚本版本...${PLAIN}"
-    local cdn_script="https://cdn.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh"
+    echo -e "${CYAN}[+] 正在检索 GitHub 原生最新脚本版本...${PLAIN}"
+    local github_raw="https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
     local proxy_script="https://ghfast.top/https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
+    local cdn_script="https://cdn.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh"
     local tmp_file="/tmp/sb_latest.sh"
 
-    if curl -fsSL "$cdn_script" -o "$tmp_file" 2>/dev/null || \
+    if curl -fsSL "$github_raw" -o "$tmp_file" 2>/dev/null || \
        curl -fsSL "$proxy_script" -o "$tmp_file" 2>/dev/null || \
-       wget -qO "$tmp_file" "$cdn_script" 2>/dev/null || \
+       curl -fsSL "$cdn_script" -o "$tmp_file" 2>/dev/null || \
+       wget -qO "$tmp_file" "$github_raw" 2>/dev/null || \
        wget -qO "$tmp_file" "$proxy_script" 2>/dev/null; then
         
         # 严格语法校验，避免更新到错误页面

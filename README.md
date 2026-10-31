@@ -21,14 +21,15 @@
 
 ## 🚀 一键安装与管理命令
 
-在你的 Linux VPS 上直接执行：
+在你的 Linux VPS 上直接执行（GitHub 原生直链，秒级同步）：
 
 ```bash
-bash <(curl -fsSL https://fastly.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh)
 ```
 
-> **备用加速源**：
-> `bash <(curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh)`
+> **国内备用加速源**（如遇 GFW 阻断可使用）：
+> `bash <(curl -fsSL https://cdn.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh)`
+> 或 `bash <(curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh)`
 
 ---
 
