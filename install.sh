@@ -5,8 +5,6 @@
 #  Features:  多节点共存 / 全球高校独立源站引擎 / BBR加速 / 完整CLI菜单
 # =========================================================================
 
-set -e
-
 # --- 终端颜色 ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -104,7 +102,129 @@ EOF
         echo "[]" > "$NODES_FILE"
     fi
 
+    import_legacy_and_233boy_nodes
     sync_and_clean_inbounds
+}
+
+# -------------------------------------------------------------
+# 1.1 自动兼容与迁移 233boy 及已有历史节点
+# -------------------------------------------------------------
+import_legacy_and_233boy_nodes() {
+    [[ ! -f "$NODES_FILE" ]] && echo "[]" > "$NODES_FILE"
+    get_public_ip
+
+    local target_files=()
+    if [[ -d "${CONF_DIR}/conf" ]]; then
+        while IFS= read -r f; do
+            [[ -f "$f" ]] && target_files+=("$f")
+        done < <(find "${CONF_DIR}/conf" -type f -name "*.json" 2>/dev/null)
+    fi
+
+    if [[ -f "$CONF_FILE" ]]; then
+        target_files+=("$CONF_FILE")
+    fi
+
+    [[ ${#target_files[@]} -eq 0 ]] && return 0
+
+    local imported_any=0
+
+    for file in "${target_files[@]}"; do
+        # 兼容提取嵌套或单层 inbounds
+        local in_objs
+        in_objs=$(jq -c '[.inbounds | .. | select(type == "object" and has("listen_port"))]' "$file" 2>/dev/null || echo "[]")
+        local count
+        count=$(echo "$in_objs" | jq 'length' 2>/dev/null || echo 0)
+        [[ "$count" -eq 0 ]] && continue
+
+        for ((i=0; i<count; i++)); do
+            local in_obj
+            in_obj=$(echo "$in_objs" | jq -c --argjson idx "$i" '.[$idx]' 2>/dev/null)
+            local itype
+            itype=$(echo "$in_obj" | jq -r '.type // empty')
+            local iport
+            iport=$(echo "$in_obj" | jq -r '.listen_port // empty')
+            local itag
+            itag=$(echo "$in_obj" | jq -r '.tag // empty')
+
+            [[ -z "$itype" || -z "$iport" ]] && continue
+            [[ -z "$itag" ]] && itag="${itype}-${iport}"
+
+            # 校验是否已在 nodes.json 中
+            local exist
+            exist=$(jq --arg t "$itag" --argjson p "$iport" '.[] | select(.tag == $t or .port == $p) | .tag' "$NODES_FILE" 2>/dev/null)
+            if [[ -n "$exist" ]]; then
+                continue
+            fi
+
+            local node_entry=""
+
+            if [[ "$itype" == "vless" ]]; then
+                local uuid=$(echo "$in_obj" | jq -r '.users[0].uuid // empty')
+                local sni=$(echo "$in_obj" | jq -r '.tls.server_name // .tls.reality.handshake.server // "www.apple.com"')
+                local sid=$(echo "$in_obj" | jq -r '.tls.reality.short_id[0] // empty')
+                # 233boy 常用模式：outbounds 中存放 public_key_<key>
+                local pbk=$(jq -r '.outbounds[]? | select(.tag | startswith("public_key_")) | .tag | sub("public_key_"; "")' "$file" 2>/dev/null)
+                pbk=${pbk:-""}
+                local is_reality=$(echo "$in_obj" | jq -r '.tls.reality.enabled // false')
+                local share_link=""
+                if [[ "$is_reality" == "true" || -n "$sid" || -n "$pbk" ]]; then
+                    share_link="vless://${uuid}@${VPS_IP}:${iport}?security=reality&flow=xtls-rprx-vision&pbk=${pbk}&sni=${sni}&sid=${sid}&type=tcp&fp=chrome#Reality-${sni}-${iport}"
+                    node_entry=$(jq -n \
+                        --arg tag "$itag" --arg type "vless-reality" --argjson port "$iport" \
+                        --arg uuid "$uuid" --arg pbk "$pbk" --arg sni "$sni" --arg sid "$sid" --arg link "$share_link" \
+                        '{tag: $tag, type: $type, port: $port, uuid: $uuid, public_key: $pbk, sni: $sni, short_id: $sid, link: $link}')
+                else
+                    share_link="vless://${uuid}@${VPS_IP}:${iport}?security=none&type=tcp#VLESS-${iport}"
+                    node_entry=$(jq -n \
+                        --arg tag "$itag" --arg type "vless" --argjson port "$iport" \
+                        --arg uuid "$uuid" --arg link "$share_link" \
+                        '{tag: $tag, type: $type, port: $port, uuid: $uuid, link: $link}')
+                fi
+
+            elif [[ "$itype" == "hysteria2" ]]; then
+                local pwd=$(echo "$in_obj" | jq -r '.users[0].password // empty')
+                local sni=$(echo "$in_obj" | jq -r '.tls.server_name // "bing.com"')
+                local link="hysteria2://${pwd}@${VPS_IP}:${iport}?insecure=1&sni=${sni}#Hy2-${iport}"
+                node_entry=$(jq -n \
+                    --arg tag "$itag" --arg type "hysteria2" --argjson port "$iport" \
+                    --arg pwd "$pwd" --arg link "$link" \
+                    '{tag: $tag, type: $type, port: $port, password: $pwd, link: $link}')
+
+            elif [[ "$itype" == "tuic" ]]; then
+                local uuid=$(echo "$in_obj" | jq -r '.users[0].uuid // empty')
+                local pwd=$(echo "$in_obj" | jq -r '.users[0].password // empty')
+                local link="tuic://${uuid}:${pwd}@${VPS_IP}:${iport}?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=bing.com#TUIC-${iport}"
+                node_entry=$(jq -n \
+                    --arg tag "$itag" --arg type "tuic" --argjson port "$iport" \
+                    --arg uuid "$uuid" --arg pwd "$pwd" --arg link "$link" \
+                    '{tag: $tag, type: $type, port: $port, uuid: $uuid, password: $pwd, link: $link}')
+
+            elif [[ "$itype" == "shadowsocks" ]]; then
+                local method=$(echo "$in_obj" | jq -r '.method // "2022-blake3-aes-128-gcm"')
+                local pwd=$(echo "$in_obj" | jq -r '.password // empty')
+                local ss_userinfo=$(echo -n "${method}:${pwd}" | base64 -w 0 2>/dev/null | tr -d '\r\n')
+                local link="ss://${ss_userinfo}@${VPS_IP}:${iport}#SS-${iport}"
+                node_entry=$(jq -n \
+                    --arg tag "$itag" --arg type "shadowsocks-2022" --argjson port "$iport" \
+                    --arg method "$method" --arg pwd "$pwd" --arg link "$link" \
+                    '{tag: $tag, type: $type, port: $port, method: $method, password: $pwd, link: $link}')
+            fi
+
+            if [[ -n "$node_entry" ]]; then
+                jq --argjson n "$node_entry" '. += [$n]' "$NODES_FILE" > "${NODES_FILE}.tmp" && mv "${NODES_FILE}.tmp" "$NODES_FILE"
+                # 如果这个来自 conf/*.json，合并同步到主 config.json
+                if [[ "$file" != "$CONF_FILE" ]]; then
+                    jq --arg t "$itag" --argjson p "$iport" '.inbounds = [.inbounds[] | select(.tag != $t and .listen_port != $p)]' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+                    jq --argjson new_in "$in_obj" '.inbounds += [$new_in]' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+                fi
+                imported_any=1
+            fi
+        done
+    done
+
+    if [[ "$imported_any" -eq 1 ]]; then
+        echo -e "${GREEN}[✓] 成功从已有环境 (如 233boy) 自动识别并迁移所有历史节点！${PLAIN}"
+    fi
 }
 
 sync_and_clean_inbounds() {
@@ -120,8 +240,6 @@ sync_and_clean_inbounds() {
                '.inbounds = ([.inbounds | .. | select(type == "object" and has("tag") and has("listen_port")) | select(.tag as $t | $tags | index($t))] | reverse | unique_by(.listen_port) | reverse)' \
                "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
         fi
-    else
-        jq '.inbounds = []' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
     fi
 
     # 如果存在节点但服务未运行，自动清除孤儿进程并拉起服务
@@ -234,18 +352,18 @@ get_public_ip() {
 is_safe_independent_origin() {
     local target="$1"
     local headers
-    headers=$(curl -sI -m 3 "https://${target}" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    headers=$(curl -sI -m 3 "https://${target}" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
     if echo "$headers" | grep -qE "server: cloudflare|cf-ray:|x-amz-cf-id:|via:.*cloudfront|x-fastly-request-id:|server: akamaighost"; then
         return 1
     fi
 
     local ip
-    ip=$(getent ahosts "$target" 2>/dev/null | awk '{print $1}' | head -n 1)
+    ip=$(getent ahosts "$target" 2>/dev/null | awk '{print $1}' | head -n 1 || true)
     [[ -z "$ip" ]] && return 1
 
     local asn_info
-    asn_info=$(curl -s4m 3 "http://ip-api.com/json/${ip}?fields=as,isp" 2>/dev/null)
-    if echo "$asn_info" | grep -qiE "cloudflare|amazon|fastly|akamai"; then
+    asn_info=$(curl -s4m 3 "http://ip-api.com/json/${ip}?fields=as,isp" 2>/dev/null || true)
+    if [[ -n "$asn_info" ]] && echo "$asn_info" | grep -qiE "cloudflare|amazon|fastly|akamai"; then
         return 1
     fi
     return 0
@@ -258,14 +376,15 @@ check_candidate_quality() {
         --tlsv1.3 --http2 \
         -w "%{http_code}|%{time_appconnect}" \
         --connect-timeout 2 -m 3 \
-        "https://${target}" 2>/dev/null)
+        "https://${target}" 2>/dev/null || echo "000|0.000000")
 
     local http_code
     http_code=$(echo "$result" | cut -d'|' -f1)
     local appconnect_time
     appconnect_time=$(echo "$result" | cut -d'|' -f2)
 
-    if [[ $? -eq 0 && "$http_code" == "200" && -n "$appconnect_time" && "$appconnect_time" != "0.000000" ]]; then
+    # 兼容支持 200, 301, 302, 304, 307, 308 等 HTTP/2 TLS 握手正常应答
+    if [[ ("$http_code" =~ ^(200|301|302|304|307|308)$) && -n "$appconnect_time" && "$appconnect_time" != "0.000000" ]]; then
         awk -v t="$appconnect_time" 'BEGIN { printf "%.0f", t * 1000 }'
         return 0
     fi
@@ -275,7 +394,7 @@ check_candidate_quality() {
 auto_select_best_sni() {
     echo -e "${CYAN}[1/3] 正在获取 VPS 归属地理信息...${PLAIN}"
     local ip_info
-    ip_info=$(curl -s4m 5 "http://ip-api.com/json/?fields=status,country,city,query")
+    ip_info=$(curl -s4m 5 "http://ip-api.com/json/?fields=status,country,city,query" 2>/dev/null || true)
     local country
     country=$(echo "$ip_info" | jq -r '.country // "United States"')
     local city
@@ -289,14 +408,14 @@ auto_select_best_sni() {
     if [[ ! -s "$json_cache" ]]; then
         local raw_url="https://raw.githubusercontent.com/Hipo/university-domains-list/master/world_universities_and_domains.json"
         local cdn_url="https://cdn.jsdelivr.net/gh/Hipo/university-domains-list@master/world_universities_and_domains.json"
-        curl -s4m 10 "$raw_url" -o "$json_cache" || curl -s4m 10 "$cdn_url" -o "$json_cache"
+        curl -s4m 10 "$raw_url" -o "$json_cache" 2>/dev/null || curl -s4m 10 "$cdn_url" -o "$json_cache" 2>/dev/null || true
     fi
 
     local candidate_domains=()
     if [[ -s "$json_cache" ]]; then
         while IFS= read -r line; do
             [[ -n "$line" ]] && candidate_domains+=("$line")
-        done < <(jq -r --arg c "$country" '.[] | select(.country == $c) | .domains[]?' "$json_cache" | sort -u)
+        done < <(jq -r --arg c "$country" '.[] | select(.country == $c) | .domains[]?' "$json_cache" 2>/dev/null | sort -u)
     fi
 
     local total=${#candidate_domains[@]}
@@ -306,8 +425,8 @@ auto_select_best_sni() {
     local sample_pool=()
     if [[ $total -gt 0 ]]; then
         while IFS= read -r line; do
-            sample_pool+=("$line")
-        done < <(printf "%s\n" "${candidate_domains[@]}" | shuf -n 12)
+            [[ -n "$line" ]] && sample_pool+=("$line")
+        done < <(printf "%s\n" "${candidate_domains[@]}" | shuf -n 12 2>/dev/null || printf "%s\n" "${candidate_domains[@]}" | head -n 12)
     fi
 
     local best_sni=""
@@ -1123,6 +1242,7 @@ update_menu() {
 # -------------------------------------------------------------
 show_menu() {
     clear
+    import_legacy_and_233boy_nodes
     sync_and_clean_inbounds
     echo -e "========================================================"
     echo -e "    ${CYAN}sing-box Full Suite Manager (233boy 增强重构版)${PLAIN}"
@@ -1210,6 +1330,7 @@ main() {
     install_dependencies
     download_singbox_core
     install_cli_shortcut
+    import_legacy_and_233boy_nodes
     sync_and_clean_inbounds
 
     if [[ $# -gt 0 ]]; then
