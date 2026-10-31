@@ -126,6 +126,13 @@ sync_and_clean_inbounds() {
     # 保证 listen_port 严格去重 (同一端口绝不允许多个 inbound 重叠绑定)
     jq '.inbounds = ([.inbounds | reverse | unique_by(.listen_port) | reverse])' \
        "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+
+    # 如果存在节点但服务未运行，自动清除孤儿进程并拉起服务
+    if [[ "$count" -gt 0 ]] && ! systemctl is-active --quiet "${APP_NAME}" 2>/dev/null; then
+        killall -9 sing-box 2>/dev/null || true
+        systemctl daemon-reload
+        systemctl restart "${APP_NAME}" 2>/dev/null || true
+    fi
 }
 
 download_singbox_core() {
@@ -991,8 +998,11 @@ enable_bbr() {
 install_cli_shortcut() {
     if [[ ! -f "$0" || "$0" == /dev/fd/* || "$0" == /proc/* || "$0" == "bash" ]]; then
         local cdn_script="https://cdn.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh"
+        local proxy_script="https://ghfast.top/https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
         curl -fsSL "$cdn_script" -o "$SCRIPT_INSTALL_PATH" 2>/dev/null || \
-        wget -qO "$SCRIPT_INSTALL_PATH" "$cdn_script" 2>/dev/null || true
+        curl -fsSL "$proxy_script" -o "$SCRIPT_INSTALL_PATH" 2>/dev/null || \
+        wget -qO "$SCRIPT_INSTALL_PATH" "$cdn_script" 2>/dev/null || \
+        wget -qO "$SCRIPT_INSTALL_PATH" "$proxy_script" 2>/dev/null || true
     else
         cp -f "$0" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
     fi
