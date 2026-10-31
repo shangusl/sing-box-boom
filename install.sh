@@ -648,11 +648,23 @@ EOF
     apply_inbound_config "$tag" "$inbound_json" "$node_meta"
 }
 
+open_port() {
+    local p="$1"
+    if command -v ufw &>/dev/null; then
+        ufw allow "$p" >/dev/null 2>&1 || true
+    fi
+    if command -v iptables &>/dev/null; then
+        iptables -I INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+        iptables -I INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+    fi
+}
+
 # 写入配置与重启服务
 apply_inbound_config() {
     local tag="$1"
     local inbound_json="$2"
     local node_meta="$3"
+    local p=$(echo "$node_meta" | jq -r '.port')
 
     init_environment
 
@@ -674,8 +686,12 @@ apply_inbound_config() {
     jq --argjson new_node "$node_meta" '. += [$new_node]' "${NODES_FILE}.tmp" > "$NODES_FILE"
     rm -f "${NODES_FILE}.tmp"
 
+    # 自动放行防火墙端口与开机自启动
+    open_port "$p"
+    systemctl daemon-reload
+    systemctl enable --now "${APP_NAME}" >/dev/null 2>&1
     systemctl restart "${APP_NAME}"
-    echo -e "${GREEN}[✓] 节点 [${tag}] 已成功添加并激活！${PLAIN}"
+    echo -e "${GREEN}[✓] 节点 [${tag}] 已成功添加并激活！服务已自动重启并在后台常驻！${PLAIN}"
     print_single_node "$tag"
 }
 
