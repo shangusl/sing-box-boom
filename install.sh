@@ -662,9 +662,10 @@ add_vless_reality() {
         --arg uuid "$uuid" \
         --arg sni "$SELECTED_SNI" \
         --arg pbk "$public_key" \
+        --arg priv "$private_key" \
         --arg sid "$short_id" \
         --arg link "$share_link" \
-        '{tag: $tag, type: $type, port: $port, uuid: $uuid, sni: $sni, public_key: $pbk, short_id: $sid, link: $link}')
+        '{tag: $tag, type: $type, port: $port, uuid: $uuid, sni: $sni, public_key: $pbk, private_key: $priv, short_id: $sid, link: $link}')
 
     apply_inbound_config "$tag" "$inbound_json" "$node_meta"
 }
@@ -858,6 +859,19 @@ apply_inbound_config() {
     p=$(echo "$node_meta" | jq -r '.port // empty')
     p=${p:-0}
 
+    # 步骤 1：必须先更新/登记 nodes.json 元数据白名单！
+    # 彻底解决“先杀新节点再登记元数据”的时序颠倒 Bug
+    jq --arg t "$tag" --arg p "$p" '[(. // [])[]? | select(.tag != $t and (.port | tostring) != $p)]' "$NODES_FILE" > "${NODES_FILE}.tmp" 2>/dev/null
+    if [[ -s "${NODES_FILE}.tmp" ]]; then
+        mv -f "${NODES_FILE}.tmp" "$NODES_FILE"
+    fi
+
+    jq --argjson new_node "$node_meta" '. = ((. // []) + [$new_node])' "$NODES_FILE" > "${NODES_FILE}.tmp" 2>/dev/null
+    if [[ -s "${NODES_FILE}.tmp" ]]; then
+        mv -f "${NODES_FILE}.tmp" "$NODES_FILE"
+    fi
+
+    # 步骤 2：将新入站规则写入核心配置 config.json
     echo -e "${CYAN}[+] 正在将入站规则写入核心配置...${PLAIN}"
     # 移除同名 tag 或相同端口的旧入站
     jq --arg t "$tag" --arg p "$p" '.inbounds = [(.inbounds // [])[]? | select(.tag != $t and (.listen_port | tostring) != $p)]' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null
@@ -871,31 +885,20 @@ apply_inbound_config() {
         mv -f "${CONF_FILE}.tmp" "$CONF_FILE"
     fi
 
-    # 严格清理并去重
+    # 步骤 3：严格清理与端口去重（此时 nodes.json 白名单中已有新 tag，绝不会误杀！）
     sync_and_clean_inbounds
 
-    # 语法检测
+    # 步骤 4：核心语法检测与防御性回滚
     if ! "$BIN_PATH" check -c "$CONF_FILE"; then
         echo -e "${RED}[错误] sing-box 语法校验失败！正在回滚...${PLAIN}"
+        jq --arg t "$tag" '[(. // [])[]? | select(.tag != $t)]' "$NODES_FILE" > "${NODES_FILE}.tmp" 2>/dev/null && mv -f "${NODES_FILE}.tmp" "$NODES_FILE"
         return 1
     fi
 
-    # 更新元数据
-    jq --arg t "$tag" --arg p "$p" '[(. // [])[]? | select(.tag != $t and (.port | tostring) != $p)]' "$NODES_FILE" > "${NODES_FILE}.tmp" 2>/dev/null
-    if [[ -s "${NODES_FILE}.tmp" ]]; then
-        mv -f "${NODES_FILE}.tmp" "$NODES_FILE"
-    fi
-
-    jq --argjson new_node "$node_meta" '. = ((. // []) + [$new_node])' "$NODES_FILE" > "${NODES_FILE}.tmp" 2>/dev/null
-    if [[ -s "${NODES_FILE}.tmp" ]]; then
-        mv -f "${NODES_FILE}.tmp" "$NODES_FILE"
-    fi
-
-    # 释放可能占用该端口的历史残留孤儿进程
+    # 步骤 5：释放孤儿端口、放行防火墙并拉起服务
     fuser -k "${p}/tcp" 2>/dev/null || true
     fuser -k "${p}/udp" 2>/dev/null || true
 
-    # 自动放行防火墙端口与开机自启动
     open_port "$p"
     systemctl daemon-reload
     systemctl enable --now "${APP_NAME}" >/dev/null 2>&1
