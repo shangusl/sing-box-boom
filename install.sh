@@ -79,31 +79,18 @@ install_dependencies() {
 # -------------------------------------------------------------
 # 1. 核心下载与初始环境初始化
 # -------------------------------------------------------------
-init_environment() {
-    mkdir -p "${CONF_DIR}"
-    # 初始化空白骨架配置
-    if [[ ! -f "$CONF_FILE" ]]; then
-        cat > "$CONF_FILE" <<EOF
-{
-  "log": {
-    "level": "warn",
-    "timestamp": true
-  },
-  "inbounds": [],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
+ensure_valid_json_file() {
+    local f="$1"
+    local default_content="$2"
+    if [[ ! -f "$f" || ! -s "$f" ]] || ! jq empty "$f" >/dev/null 2>&1; then
+        echo "$default_content" > "$f"
+    fi
 }
-EOF
-    fi
 
-    # 初始化节点元数据文件
-    if [[ ! -f "$NODES_FILE" ]]; then
-        echo "[]" > "$NODES_FILE"
-    fi
+init_environment() {
+    mkdir -p "${CONF_DIR}" "${CORE_BIN_DIR}"
+    ensure_valid_json_file "$CONF_FILE" '{"log":{"level":"warn","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}'
+    ensure_valid_json_file "$NODES_FILE" "[]"
 
     import_legacy_and_233boy_nodes
     sync_and_clean_inbounds
@@ -113,7 +100,8 @@ EOF
 # 1.1 自动兼容与迁移 233boy 及已有历史节点
 # -------------------------------------------------------------
 import_legacy_and_233boy_nodes() {
-    [[ ! -f "$NODES_FILE" ]] && echo "[]" > "$NODES_FILE"
+    ensure_valid_json_file "$NODES_FILE" "[]"
+    ensure_valid_json_file "$CONF_FILE" '{"log":{"level":"warn","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}'
     get_public_ip
 
     local target_files=()
@@ -132,9 +120,9 @@ import_legacy_and_233boy_nodes() {
     local imported_any=0
 
     for file in "${target_files[@]}"; do
-        # 兼容提取嵌套或单层 inbounds
+        # 兼容提取嵌套或单层 inbounds（无论是否有 inbounds 键包装）
         local in_objs
-        in_objs=$(jq -c '[.inbounds | .. | select(type == "object" and has("listen_port"))]' "$file" 2>/dev/null || echo "[]")
+        in_objs=$(jq -c '[.. | select(type == "object" and has("type") and has("listen_port"))]' "$file" 2>/dev/null || echo "[]")
         local count
         count=$(echo "$in_objs" | jq 'length' 2>/dev/null || echo 0)
         [[ "$count" -eq 0 ]] && continue
@@ -205,7 +193,7 @@ import_legacy_and_233boy_nodes() {
             elif [[ "$itype" == "shadowsocks" ]]; then
                 local method=$(echo "$in_obj" | jq -r '.method // "2022-blake3-aes-128-gcm"')
                 local pwd=$(echo "$in_obj" | jq -r '.password // empty')
-                local ss_userinfo=$(echo -n "${method}:${pwd}" | base64 -w 0 2>/dev/null | tr -d '\r\n')
+                local ss_userinfo=$(echo -n "${method}:${pwd}" | base64 2>/dev/null | tr -d '\r\n')
                 local link="ss://${ss_userinfo}@${VPS_IP}:${iport}#SS-${iport}"
                 node_entry=$(jq -n \
                     --arg tag "$itag" --arg type "shadowsocks-2022" --argjson port "$iport" \
@@ -214,11 +202,13 @@ import_legacy_and_233boy_nodes() {
             fi
 
             if [[ -n "$node_entry" ]]; then
-                jq --argjson n "$node_entry" '. += [$n]' "$NODES_FILE" > "${NODES_FILE}.tmp" && mv "${NODES_FILE}.tmp" "$NODES_FILE"
+                ensure_valid_json_file "$NODES_FILE" "[]"
+                jq --argjson n "$node_entry" '. += [$n]' "$NODES_FILE" > "${NODES_FILE}.tmp" 2>/dev/null && mv "${NODES_FILE}.tmp" "$NODES_FILE"
                 # 如果这个来自 conf/*.json，合并同步到主 config.json
                 if [[ "$file" != "$CONF_FILE" ]]; then
-                    jq --arg t "$itag" --argjson p "$iport" '.inbounds = [.inbounds[] | select(.tag != $t and .listen_port != $p)]' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
-                    jq --argjson new_in "$in_obj" '.inbounds += [$new_in]' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+                    ensure_valid_json_file "$CONF_FILE" '{"log":{"level":"warn","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}'
+                    jq --arg t "$itag" --argjson p "$iport" '.inbounds = [(.inbounds // [])[]? | select(.tag != $t and .listen_port != $p)]' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+                    jq --argjson new_in "$in_obj" '.inbounds = ((.inbounds // []) + [$new_in])' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
                 fi
                 imported_any=1
             fi
@@ -1096,7 +1086,8 @@ print_single_node() {
 
 show_all_nodes() {
     local count
-    count=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
+    count=$(jq 'length' "$NODES_FILE" 2>/dev/null)
+    count=${count:-0}
     if [[ "$count" -eq 0 ]]; then
         echo -e "${YELLOW}[!] 当前未配置任何节点，请选择添加节点！${PLAIN}"
         return
@@ -1293,7 +1284,8 @@ show_menu() {
     echo -e "--------------------------------------------------------"
     
     local count
-    count=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
+    count=$(jq 'length' "$NODES_FILE" 2>/dev/null)
+    count=${count:-0}
     echo -e " 已配置活跃节点总数: ${YELLOW}${count}${PLAIN} 个"
     if [[ "$count" -gt 0 ]]; then
         jq -r 'to_entries[] | "  [\(.key + 1)] \(.value.type) (端口: \(.value.port))"' "$NODES_FILE" 2>/dev/null || true
