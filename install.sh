@@ -734,7 +734,13 @@ enable_bbr() {
 # 7. 全局 CLI 快捷键注册
 # -------------------------------------------------------------
 install_cli_shortcut() {
-    cp -f "$0" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
+    if [[ ! -f "$0" || "$0" == /dev/fd/* || "$0" == /proc/* || "$0" == "bash" ]]; then
+        local cdn_script="https://cdn.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh"
+        curl -fsSL "$cdn_script" -o "$SCRIPT_INSTALL_PATH" 2>/dev/null || \
+        wget -qO "$SCRIPT_INSTALL_PATH" "$cdn_script" 2>/dev/null || true
+    else
+        cp -f "$0" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
+    fi
     chmod +x "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
 }
 
@@ -836,31 +842,35 @@ show_menu() {
 # -------------------------------------------------------------
 # 10. 程序主入口 (支持子命令直接调用)
 # -------------------------------------------------------------
-check_root
-install_dependencies
-download_singbox_core
-install_cli_shortcut
+main() {
+    check_root
+    install_dependencies
+    download_singbox_core
+    install_cli_shortcut
 
-if [[ $# -gt 0 ]]; then
-    case "$1" in
-        add) menu_add_node ;;
-        del) delete_node ;;
-        info|list) show_all_nodes ;;
-        bbr) enable_bbr ;;
-        start) systemctl start "${APP_NAME}" ;;
-        stop) systemctl stop "${APP_NAME}" ;;
-        restart) systemctl restart "${APP_NAME}" ;;
-        status) systemctl status "${APP_NAME}" ;;
-        log) journalctl -u "${APP_NAME}" -f -n 50 ;;
-        *) echo "用法: sb [add|del|info|list|bbr|start|stop|restart|status|log]" ;;
-    esac
-else
-    # 初次安装若无节点，引导添加第一个节点
-    local current_nodes
-    current_nodes=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
-    if [[ "$current_nodes" -eq 0 ]]; then
-        echo -e "${GREEN}首次安装，请添加你的第一个代理节点：${PLAIN}"
-        menu_add_node
+    if [[ $# -gt 0 ]]; then
+        case "$1" in
+            add) menu_add_node ;;
+            del) delete_node ;;
+            info|list) show_all_nodes ;;
+            bbr) enable_bbr ;;
+            start) systemctl start "${APP_NAME}" ;;
+            stop) systemctl stop "${APP_NAME}" ;;
+            restart) systemctl restart "${APP_NAME}" ;;
+            status) systemctl status "${APP_NAME}" ;;
+            log) journalctl -u "${APP_NAME}" -f -n 50 ;;
+            *) echo "用法: sb [add|del|info|list|bbr|start|stop|restart|status|log]" ;;
+        esac
+    else
+        # 初次安装若无节点，引导添加第一个节点
+        local current_nodes
+        current_nodes=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
+        if [[ "$current_nodes" -eq 0 ]]; then
+            echo -e "${GREEN}首次安装，请添加你的第一个代理节点：${PLAIN}"
+            menu_add_node
+        fi
+        show_menu
     fi
-    show_menu
-fi
+}
+
+main "$@"
