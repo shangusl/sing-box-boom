@@ -82,15 +82,62 @@ install_dependencies() {
 ensure_valid_json_file() {
     local f="$1"
     local default_content="$2"
-    if [[ ! -f "$f" || ! -s "$f" ]] || ! jq empty "$f" >/dev/null 2>&1; then
+    local expected_type="${3:-}"
+
+    local valid=1
+    if [[ ! -f "$f" || ! -s "$f" ]]; then
+        valid=0
+    elif ! jq empty "$f" >/dev/null 2>&1; then
+        valid=0
+    elif [[ -n "$expected_type" ]]; then
+        if ! jq -e "type == \"$expected_type\"" "$f" >/dev/null 2>&1; then
+            valid=0
+        fi
+    fi
+
+    if [[ "$valid" -eq 0 ]]; then
         echo "$default_content" > "$f"
+    fi
+}
+
+ensure_systemd_service() {
+    local need_update=0
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        need_update=1
+    elif ! grep -q "ExecStart=${CORE_BIN}" "$SERVICE_FILE" 2>/dev/null; then
+        need_update=1
+    fi
+
+    if [[ "$need_update" -eq 1 ]]; then
+        cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=sing-box Full Suite Service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=${CORE_BIN} run -c ${CONF_FILE}
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable "${APP_NAME}" >/dev/null 2>&1
     fi
 }
 
 init_environment() {
     mkdir -p "${CONF_DIR}" "${CORE_BIN_DIR}"
-    ensure_valid_json_file "$CONF_FILE" '{"log":{"level":"warn","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}'
-    ensure_valid_json_file "$NODES_FILE" "[]"
+    ensure_valid_json_file "$CONF_FILE" '{"log":{"level":"warn","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' "object"
+    ensure_valid_json_file "$NODES_FILE" "[]" "array"
+    ensure_systemd_service
 
     import_legacy_and_233boy_nodes
     sync_and_clean_inbounds
@@ -100,19 +147,15 @@ init_environment() {
 # 1.1 自动兼容与迁移 233boy 及已有历史节点
 # -------------------------------------------------------------
 import_legacy_and_233boy_nodes() {
-    ensure_valid_json_file "$NODES_FILE" "[]"
-    ensure_valid_json_file "$CONF_FILE" '{"log":{"level":"warn","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}'
+    ensure_valid_json_file "$NODES_FILE" "[]" "array"
+    ensure_valid_json_file "$CONF_FILE" '{"log":{"level":"warn","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' "object"
     get_public_ip
 
     local target_files=()
-    if [[ -d "${CONF_DIR}/conf" ]]; then
+    if [[ -d "${CONF_DIR}" ]]; then
         while IFS= read -r f; do
             [[ -f "$f" ]] && target_files+=("$f")
-        done < <(find "${CONF_DIR}/conf" -type f -name "*.json" 2>/dev/null)
-    fi
-
-    if [[ -f "$CONF_FILE" ]]; then
-        target_files+=("$CONF_FILE")
+        done < <(find "${CONF_DIR}" -type f -name "*.json" ! -name "nodes.json" ! -name "*.tmp" ! -name "*.bak" 2>/dev/null)
     fi
 
     [[ ${#target_files[@]} -eq 0 ]] && return 0
@@ -122,9 +165,10 @@ import_legacy_and_233boy_nodes() {
     for file in "${target_files[@]}"; do
         # 兼容提取嵌套或单层 inbounds（无论是否有 inbounds 键包装）
         local in_objs
-        in_objs=$(jq -c '[.. | select(type == "object" and has("type") and has("listen_port"))]' "$file" 2>/dev/null || echo "[]")
+        in_objs=$(jq -c '[.. | select(type == "object" and (.type | IN("vless", "hysteria2", "tuic", "shadowsocks", "trojan", "vmess")) and has("listen_port"))]' "$file" 2>/dev/null || echo "[]")
         local count
         count=$(echo "$in_objs" | jq 'length' 2>/dev/null || echo 0)
+        count=${count:-0}
         [[ "$count" -eq 0 ]] && continue
 
         for ((i=0; i<count; i++)); do
@@ -142,7 +186,7 @@ import_legacy_and_233boy_nodes() {
 
             # 校验是否已在 nodes.json 中
             local exist
-            exist=$(jq --arg t "$itag" --argjson p "$iport" '.[] | select(.tag == $t or .port == $p) | .tag' "$NODES_FILE" 2>/dev/null)
+            exist=$(jq --arg t "$itag" --arg p "$iport" '.[] | select(.tag == $t or (.port | tostring) == $p) | .tag' "$NODES_FILE" 2>/dev/null)
             if [[ -n "$exist" ]]; then
                 continue
             fi
@@ -153,8 +197,11 @@ import_legacy_and_233boy_nodes() {
                 local uuid=$(echo "$in_obj" | jq -r '.users[0].uuid // empty')
                 local sni=$(echo "$in_obj" | jq -r '.tls.server_name // .tls.reality.handshake.server // "www.apple.com"')
                 local sid=$(echo "$in_obj" | jq -r '.tls.reality.short_id[0] // empty')
-                # 233boy 常用模式：outbounds 中存放 public_key_<key>
+                # 233boy 常用模式：outbounds 中存放 public_key_<key>，或者 reality 自身携带 public_key
                 local pbk=$(jq -r '.outbounds[]? | select(.tag | startswith("public_key_")) | .tag | sub("public_key_"; "")' "$file" 2>/dev/null)
+                if [[ -z "$pbk" || "$pbk" == "null" ]]; then
+                    pbk=$(echo "$in_obj" | jq -r '.tls.reality.public_key // empty')
+                fi
                 pbk=${pbk:-""}
                 local is_reality=$(echo "$in_obj" | jq -r '.tls.reality.enabled // false')
                 local share_link=""
@@ -202,13 +249,27 @@ import_legacy_and_233boy_nodes() {
             fi
 
             if [[ -n "$node_entry" ]]; then
-                ensure_valid_json_file "$NODES_FILE" "[]"
-                jq --argjson n "$node_entry" '. += [$n]' "$NODES_FILE" > "${NODES_FILE}.tmp" 2>/dev/null && mv "${NODES_FILE}.tmp" "$NODES_FILE"
-                # 如果这个来自 conf/*.json，合并同步到主 config.json
+                ensure_valid_json_file "$NODES_FILE" "[]" "array"
+                jq --argjson n "$node_entry" '. = ((. // []) + [$n])' "$NODES_FILE" > "${NODES_FILE}.tmp" 2>/dev/null
+                if [[ -s "${NODES_FILE}.tmp" ]] && jq -e 'type == "array"' "${NODES_FILE}.tmp" >/dev/null 2>&1; then
+                    mv -f "${NODES_FILE}.tmp" "$NODES_FILE"
+                fi
+
+                # 如果这个来自 conf/*.json 或非主配置文件，合并同步到主 config.json
                 if [[ "$file" != "$CONF_FILE" ]]; then
-                    ensure_valid_json_file "$CONF_FILE" '{"log":{"level":"warn","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}'
-                    jq --arg t "$itag" --argjson p "$iport" '.inbounds = [(.inbounds // [])[]? | select(.tag != $t and .listen_port != $p)]' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
-                    jq --argjson new_in "$in_obj" '.inbounds = ((.inbounds // []) + [$new_in])' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+                    ensure_valid_json_file "$CONF_FILE" '{"log":{"level":"warn","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' "object"
+                    # 确保 in_obj 有 tag
+                    if [[ -z $(echo "$in_obj" | jq -r '.tag // empty') ]]; then
+                        in_obj=$(echo "$in_obj" | jq --arg t "$itag" '. + {tag: $t}')
+                    fi
+                    jq --arg t "$itag" --arg p "$iport" '.inbounds = [(.inbounds // [])[]? | select(.tag != $t and (.listen_port | tostring) != $p)]' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null
+                    if [[ -s "${CONF_FILE}.tmp" ]]; then
+                        mv -f "${CONF_FILE}.tmp" "$CONF_FILE"
+                    fi
+                    jq --argjson new_in "$in_obj" '.inbounds = ((.inbounds // []) + [$new_in])' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null
+                    if [[ -s "${CONF_FILE}.tmp" ]]; then
+                        mv -f "${CONF_FILE}.tmp" "$CONF_FILE"
+                    fi
                 fi
                 imported_any=1
             fi
@@ -222,8 +283,12 @@ import_legacy_and_233boy_nodes() {
 
 sync_and_clean_inbounds() {
     [[ ! -f "$CONF_FILE" || ! -f "$NODES_FILE" ]] && return 0
+    ensure_valid_json_file "$NODES_FILE" "[]" "array"
+    ensure_valid_json_file "$CONF_FILE" '{"log":{"level":"warn","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' "object"
+
     local count
     count=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
+    count=${count:-0}
     if [[ "$count" -gt 0 ]]; then
         local valid_tags
         valid_tags=$(jq -c '[.[].tag]' "$NODES_FILE" 2>/dev/null)
@@ -231,7 +296,10 @@ sync_and_clean_inbounds() {
             # 展平所有可能被多重包装的数组，提取有效 tag 并按 listen_port 保证 1D 数组去重
             jq --argjson tags "$valid_tags" \
                '.inbounds = ([.inbounds | .. | select(type == "object" and has("tag") and has("listen_port")) | select(.tag as $t | $tags | index($t))] | reverse | unique_by(.listen_port) | reverse)' \
-               "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+               "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null
+            if [[ -s "${CONF_FILE}.tmp" ]] && jq -e 'type == "object"' "${CONF_FILE}.tmp" >/dev/null 2>&1; then
+                mv -f "${CONF_FILE}.tmp" "$CONF_FILE"
+            fi
         fi
     fi
 
@@ -285,52 +353,7 @@ download_singbox_core() {
     rm -rf "/tmp/sing-box"*
     echo -e "${GREEN}[✓] sing-box 核心安装成功 -> ${CORE_BIN}${PLAIN}"
 
-    # 初始化空白骨架配置
-    if [[ ! -f "$CONF_FILE" ]]; then
-        cat > "$CONF_FILE" <<EOF
-{
-  "log": {
-    "level": "warn",
-    "timestamp": true
-  },
-  "inbounds": [],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-EOF
-    fi
-
-    # 初始化节点元数据文件
-    if [[ ! -f "$NODES_FILE" ]]; then
-        echo "[]" > "$NODES_FILE"
-    fi
-
-    # 注册 systemd 守护进程
-    cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=sing-box Full Suite Service
-Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
-
-[Service]
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=${BIN_PATH} run -c ${CONF_FILE}
-Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable "${APP_NAME}" >/dev/null 2>&1
+    init_environment
 }
 
 ensure_tls_cert() {
@@ -823,14 +846,31 @@ apply_inbound_config() {
     local tag="$1"
     local inbound_json="$2"
     local node_meta="$3"
-    local p=$(echo "$node_meta" | jq -r '.port')
+
+    if [[ -z "$tag" || -z "$inbound_json" || -z "$node_meta" ]]; then
+        echo -e "${RED}[错误] 入站配置生成失败，无法写入配置！${PLAIN}"
+        return 1
+    fi
+
+    ensure_valid_json_file "$CONF_FILE" '{"log":{"level":"warn","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' "object"
+    ensure_valid_json_file "$NODES_FILE" "[]" "array"
+
+    local p
+    p=$(echo "$node_meta" | jq -r '.port // empty')
+    p=${p:-0}
 
     echo -e "${CYAN}[+] 正在将入站规则写入核心配置...${PLAIN}"
     # 移除同名 tag 或相同端口的旧入站
-    jq --arg t "$tag" --argjson p "$p" '.inbounds = [.inbounds[] | select(.tag != $t and .listen_port != $p)]' "$CONF_FILE" > "${CONF_FILE}.tmp"
+    jq --arg t "$tag" --arg p "$p" '.inbounds = [(.inbounds // [])[]? | select(.tag != $t and (.listen_port | tostring) != $p)]' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null
+    if [[ -s "${CONF_FILE}.tmp" ]]; then
+        mv -f "${CONF_FILE}.tmp" "$CONF_FILE"
+    fi
+
     # 追加新入站
-    jq --argjson new_in "$inbound_json" '.inbounds += [$new_in]' "${CONF_FILE}.tmp" > "$CONF_FILE"
-    rm -f "${CONF_FILE}.tmp"
+    jq --argjson new_in "$inbound_json" '.inbounds = ((.inbounds // []) + [$new_in])' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null
+    if [[ -s "${CONF_FILE}.tmp" ]]; then
+        mv -f "${CONF_FILE}.tmp" "$CONF_FILE"
+    fi
 
     # 严格清理并去重
     sync_and_clean_inbounds
@@ -838,13 +878,19 @@ apply_inbound_config() {
     # 语法检测
     if ! "$BIN_PATH" check -c "$CONF_FILE"; then
         echo -e "${RED}[错误] sing-box 语法校验失败！正在回滚...${PLAIN}"
-        exit 1
+        return 1
     fi
 
     # 更新元数据
-    jq --arg t "$tag" --argjson p "$p" '[.[] | select(.tag != $t and .port != $p)]' "$NODES_FILE" > "${NODES_FILE}.tmp"
-    jq --argjson new_node "$node_meta" '. += [$new_node]' "${NODES_FILE}.tmp" > "$NODES_FILE"
-    rm -f "${NODES_FILE}.tmp"
+    jq --arg t "$tag" --arg p "$p" '[(. // [])[]? | select(.tag != $t and (.port | tostring) != $p)]' "$NODES_FILE" > "${NODES_FILE}.tmp" 2>/dev/null
+    if [[ -s "${NODES_FILE}.tmp" ]]; then
+        mv -f "${NODES_FILE}.tmp" "$NODES_FILE"
+    fi
+
+    jq --argjson new_node "$node_meta" '. = ((. // []) + [$new_node])' "$NODES_FILE" > "${NODES_FILE}.tmp" 2>/dev/null
+    if [[ -s "${NODES_FILE}.tmp" ]]; then
+        mv -f "${NODES_FILE}.tmp" "$NODES_FILE"
+    fi
 
     # 释放可能占用该端口的历史残留孤儿进程
     fuser -k "${p}/tcp" 2>/dev/null || true
@@ -1374,10 +1420,13 @@ main() {
     else
         # 初次安装若无节点，引导添加第一个节点
         local current_nodes
-        current_nodes=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
+        current_nodes=$(jq 'length' "$NODES_FILE" 2>/dev/null)
+        current_nodes=${current_nodes:-0}
         if [[ "$current_nodes" -eq 0 ]]; then
             echo -e "${GREEN}首次安装，请添加你的第一个代理节点：${PLAIN}"
             menu_add_node
+            echo ""
+            read -n 1 -s -r -p "按任意键进入主菜单..."
         fi
         show_menu
     fi
