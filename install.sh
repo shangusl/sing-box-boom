@@ -139,6 +139,7 @@ init_environment() {
     ensure_systemd_service
 
     import_legacy_and_233boy_nodes
+    repair_missing_reality_pubkeys
     sync_and_clean_inbounds
 }
 
@@ -196,10 +197,14 @@ import_legacy_and_233boy_nodes() {
                 local uuid=$(echo "$in_obj" | jq -r '.users[0].uuid // empty')
                 local sni=$(echo "$in_obj" | jq -r '.tls.server_name // .tls.reality.handshake.server // "www.apple.com"')
                 local sid=$(echo "$in_obj" | jq -r '.tls.reality.short_id[0] // empty')
-                # 233boy 常用模式：outbounds 中存放 public_key_<key>，或者 reality 自身携带 public_key
+                local priv=$(echo "$in_obj" | jq -r '.tls.reality.private_key // empty')
+                # 233boy 常用模式：outbounds 中存放 public_key_<key>，或者 reality 自身携带 public_key，或者通过私钥纯数学推导
                 local pbk=$(jq -r '.outbounds[]? | select(.tag | startswith("public_key_")) | .tag | sub("public_key_"; "")' "$file" 2>/dev/null)
                 if [[ -z "$pbk" || "$pbk" == "null" ]]; then
                     pbk=$(echo "$in_obj" | jq -r '.tls.reality.public_key // empty')
+                fi
+                if [[ -z "$pbk" || "$pbk" == "null" ]] && [[ -n "$priv" ]]; then
+                    pbk=$(derive_reality_pubkey "$priv")
                 fi
                 pbk=${pbk:-""}
                 local is_reality=$(echo "$in_obj" | jq -r '.tls.reality.enabled // false')
@@ -353,6 +358,72 @@ download_singbox_core() {
     echo -e "${GREEN}[✓] sing-box 核心安装成功 -> ${CORE_BIN}${PLAIN}"
 
     init_environment
+}
+
+# -------------------------------------------------------------
+# 1.2 X25519 纯数学推导与公钥自愈引擎 (彻底终结 Reality 公钥缺失)
+# -------------------------------------------------------------
+derive_reality_pubkey() {
+    local priv="$1"
+    [[ -z "$priv" ]] && return
+    (printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20'; echo "$priv" | base64 -d) 2>/dev/null | \
+        openssl pkey -inform DER -pubout -outform DER 2>/dev/null | tail -c 32 | base64 2>/dev/null | tr -d '\r\n[:space:]'
+}
+
+repair_missing_reality_pubkeys() {
+    [[ ! -f "$NODES_FILE" || ! -f "$CONF_FILE" ]] && return 0
+    ensure_valid_json_file "$NODES_FILE" "[]" "array"
+    ensure_valid_json_file "$CONF_FILE" '{"log":{"level":"warn","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' "object"
+
+    local count
+    count=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
+    count=${count:-0}
+    [[ "$count" -eq 0 ]] && return 0
+
+    for ((idx=0; idx<count; idx++)); do
+        local n_type
+        n_type=$(jq -r --argjson i "$idx" '.[$i].type // empty' "$NODES_FILE" 2>/dev/null)
+        [[ "$n_type" != "vless-reality" && "$n_type" != "vless" ]] && continue
+
+        local n_tag
+        n_tag=$(jq -r --argjson i "$idx" '.[$i].tag // empty' "$NODES_FILE" 2>/dev/null)
+        local n_pbk
+        n_pbk=$(jq -r --argjson i "$idx" '.[$i].public_key // empty' "$NODES_FILE" 2>/dev/null)
+        local n_link
+        n_link=$(jq -r --argjson i "$idx" '.[$i].link // empty' "$NODES_FILE" 2>/dev/null)
+
+        if [[ -z "$n_pbk" || "$n_pbk" == "null" || "$n_link" == *"pbk=&"* || "$n_link" == *"pbk=null"* ]]; then
+            local priv
+            priv=$(jq -r --arg t "$n_tag" '.inbounds[]? | select(.tag == $t) | .tls.reality.private_key // empty' "$CONF_FILE" 2>/dev/null)
+            if [[ -z "$priv" ]]; then
+                priv=$(jq -r --argjson i "$idx" '.[$i].private_key // empty' "$NODES_FILE" 2>/dev/null)
+            fi
+
+            if [[ -n "$priv" ]]; then
+                local derived_pbk
+                derived_pbk=$(derive_reality_pubkey "$priv")
+                if [[ -n "$derived_pbk" ]]; then
+                    local new_link="$n_link"
+                    if [[ "$new_link" == *"pbk=&"* ]]; then
+                        new_link="${new_link/pbk=&/pbk=${derived_pbk}&}"
+                    elif [[ "$new_link" == *"pbk=null"* ]]; then
+                        new_link="${new_link/pbk=null/pbk=${derived_pbk}}"
+                    elif [[ "$new_link" == *"pbk="* ]]; then
+                        new_link=$(echo "$new_link" | sed -E "s/pbk=[^&]*/pbk=${derived_pbk}/")
+                    else
+                        new_link="${new_link}&pbk=${derived_pbk}"
+                    fi
+
+                    jq --argjson i "$idx" --arg pbk "$derived_pbk" --arg l "$new_link" \
+                       '.[$i].public_key = $pbk | .[$i].link = $l' \
+                       "$NODES_FILE" > "${NODES_FILE}.tmp" 2>/dev/null
+                    if [[ -s "${NODES_FILE}.tmp" ]]; then
+                        mv -f "${NODES_FILE}.tmp" "$NODES_FILE"
+                    fi
+                fi
+            fi
+        fi
+    done
 }
 
 ensure_tls_cert() {
@@ -611,6 +682,10 @@ add_vless_reality() {
         local tmp_keys=($(echo "$keypair" | sed 's/.*://'))
         private_key=$(echo "${tmp_keys[0]}" | tr -d ' "\r\n')
         public_key=$(echo "${tmp_keys[1]}" | tr -d ' "\r\n')
+    fi
+
+    if [[ -z "$public_key" && -n "$private_key" ]]; then
+        public_key=$(derive_reality_pubkey "$private_key")
     fi
 
     local short_id
@@ -1315,6 +1390,7 @@ update_menu() {
 show_menu() {
     clear
     import_legacy_and_233boy_nodes
+    repair_missing_reality_pubkeys
     sync_and_clean_inbounds
     echo -e "========================================================"
     echo -e "    ${CYAN}sing-box Full Suite Manager (233boy 增强重构版)${PLAIN}"
@@ -1404,6 +1480,7 @@ main() {
     download_singbox_core
     install_cli_shortcut
     import_legacy_and_233boy_nodes
+    repair_missing_reality_pubkeys
     sync_and_clean_inbounds
 
     if [[ $# -gt 0 ]]; then
