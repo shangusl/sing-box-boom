@@ -1,27 +1,3 @@
-# sing-box-boom 🚀
-
-> 全面复刻并超越 **233boy/sing-box** 的全协议多节点现代管理套件。
-> 支持 **VLESS-Reality / Hysteria 2 / TUIC v5 / Shadowsocks 2022** 多协议一机共存。
-> 搭载 **全球高校独立源站动态优选引擎**（已彻底清退 Cloudflare），杜绝被借道白嫖流量。
-
----
-
-## 🌟 协议支持矩阵
-
-| 协议 | 传输层 / 特性 | 推荐应用场景 |
-| :--- | :--- | :--- |
-| **VLESS-Reality** | TCP + Vision 流控 + 高校动态优选防白嫖 | 最稳日常主力翻墙、防 GFW 主动嗅探 |
-| **Hysteria 2** | UDP 暴力加速 / 极速抗丢包 / 自签 ECDSA | 晚高峰、跨洲长距离高丢包网络、游戏加速 |
-| **TUIC v5** | QUIC 0-RTT 握手 / 内置 BBR 算法 | 移动网络、弱网环境下极速低延迟开屏 |
-| **Shadowsocks 2022** | 现代抗重放加密 (`2022-blake3-aes-128-gcm`) | 路由器轻量客户端、纯净低功耗设备 |
-| **多节点共存** | 支持一机同时开 4 个甚至更多不同协议端口 | 多客户端灵活分流、好友互不干扰 |
-| **系统 BBR** | Linux 原生 BBR + FQ 算法一键开启 | 显著提升 VPS 的 TCP/UDP 传输速率与稳定性 |
-
----
-
-## 🚀 一键安装与管理命令
-
-在你的 Linux VPS 上直接执行（GitHub 原生直链，秒级同步）：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh)
@@ -52,7 +28,6 @@ sbox status        # 查看服务运行状态
 sbox log           # 实时查看运行日志 (tail -f)
 ```
 
-> **注**：本脚本专属使用 `sbox` 指令，彻底保留原版 233boy 的 `sb` 快捷方式，两者在系统内和平共存、互不干扰！
 
 ---
 
