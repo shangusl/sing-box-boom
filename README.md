@@ -33,22 +33,26 @@ bash <(curl -fsSL https://raw.githubusercontent.com/shangusl/sing-box-boom/main/
 
 ---
 
-## 🛠 命令行快捷指令体系 (与 233boy 完全对标)
+## 🛠 命令行快捷指令体系 (独立命令 `sbox`，不与 233boy 冲突)
 
-安装后，在终端随时直接敲快捷命令：
+安装后，在终端随时直接敲专属快捷命令：
 
 ```bash
-sb               # 呼出交互式管理总控制台
-sb add           # 快速添加一个新协议节点 (Reality / Hy2 / TUIC / SS)
-sb del           # 快速删除指定的节点
-sb info          # 查看所有节点的配置信息、连接串与终端二维码
-sb bbr           # 一键开启系统内核原生 BBR 加速
-sb start         # 启动 sing-box 服务
-sb stop          # 停止 sing-box 服务
-sb restart       # 重启 sing-box 服务
-sb status        # 查看服务运行状态
-sb log           # 实时查看运行日志 (tail -f)
+sbox               # 呼出交互式管理总控制台
+sbox add           # 快速添加一个新协议节点 (Reality / Hy2 / TUIC / SS)
+sbox modify        # 快速修改现有节点 (改端口 / 换高校SNI / 刷新凭据)
+sbox del           # 快速删除指定的节点
+sbox info          # 查看所有节点的配置信息、连接串与终端二维码
+sbox bbr           # 一键开启系统内核原生 BBR 加速
+sbox update        # 在线升级脚本自身或 sing-box 核心
+sbox start         # 启动 sing-box 服务
+sbox stop          # 停止 sing-box 服务
+sbox restart       # 重启 sing-box 服务
+sbox status        # 查看服务运行状态
+sbox log           # 实时查看运行日志 (tail -f)
 ```
+
+> **注**：本脚本专属使用 `sbox` 指令，彻底保留原版 233boy 的 `sb` 快捷方式，两者在系统内和平共存、互不干扰！
 
 ---
 

@@ -22,8 +22,7 @@ NODES_FILE="${CONF_DIR}/nodes.json"
 CERT_FILE="${CONF_DIR}/cert.crt"
 KEY_FILE="${CONF_DIR}/cert.key"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
-SCRIPT_INSTALL_PATH="/usr/local/bin/sb"
-SCRIPT_ALT_PATH="/usr/local/bin/sing-box"
+SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 CORE_BIN_DIR="${CONF_DIR}/bin"
 CORE_BIN="${CORE_BIN_DIR}/sing-box"
 BIN_PATH="${CORE_BIN}"
@@ -1167,31 +1166,30 @@ enable_bbr() {
 }
 
 # -------------------------------------------------------------
-# 7. 全局 CLI 快捷键注册
+# 7. 全局 CLI 快捷键注册 (独立命令: sbox，不与 233boy sb 冲突)
 # -------------------------------------------------------------
 install_cli_shortcut() {
-    # 若存在 233boy 原版脚本，自动安全备份为 sb-233，双向保留
-    if [[ -f "$SCRIPT_INSTALL_PATH" ]] && ! grep -q "sing-box-boom" "$SCRIPT_INSTALL_PATH" 2>/dev/null; then
-        cp -f "$SCRIPT_INSTALL_PATH" "/usr/local/bin/sb-233" 2>/dev/null || true
-        chmod +x "/usr/local/bin/sb-233" 2>/dev/null || true
+    # 保持 233boy 原汁原味：若之前有备份的 sb-233，自动恢复回 /usr/local/bin/sb
+    if [[ -f "/usr/local/bin/sb-233" ]]; then
+        mv -f "/usr/local/bin/sb-233" "/usr/local/bin/sb" 2>/dev/null || true
+        chmod +x "/usr/local/bin/sb" 2>/dev/null || true
     fi
 
-    local install_targets=("$SCRIPT_INSTALL_PATH" "$SCRIPT_ALT_PATH")
-    for target in "${install_targets[@]}"; do
-        if [[ ! -f "$0" || "$0" == /dev/fd/* || "$0" == /proc/* || "$0" == "bash" ]]; then
-            local github_raw="https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
-            local proxy_script="https://ghfast.top/https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
-            local cdn_script="https://cdn.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh"
-            curl -fsSL "$github_raw" -o "$target" 2>/dev/null || \
-            curl -fsSL "$proxy_script" -o "$target" 2>/dev/null || \
-            curl -fsSL "$cdn_script" -o "$target" 2>/dev/null || \
-            wget -qO "$target" "$github_raw" 2>/dev/null || \
-            wget -qO "$target" "$proxy_script" 2>/dev/null || true
-        else
-            cp -f "$0" "$target" 2>/dev/null || true
-        fi
-        chmod +x "$target" 2>/dev/null || true
-    done
+    # 本增强版独立注册专属快捷指令: sbox
+    local target="$SCRIPT_INSTALL_PATH"
+    if [[ ! -f "$0" || "$0" == /dev/fd/* || "$0" == /proc/* || "$0" == "bash" ]]; then
+        local github_raw="https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
+        local proxy_script="https://ghfast.top/https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
+        local cdn_script="https://cdn.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh"
+        curl -fsSL "$github_raw" -o "$target" 2>/dev/null || \
+        curl -fsSL "$proxy_script" -o "$target" 2>/dev/null || \
+        curl -fsSL "$cdn_script" -o "$target" 2>/dev/null || \
+        wget -qO "$target" "$github_raw" 2>/dev/null || \
+        wget -qO "$target" "$proxy_script" 2>/dev/null || true
+    else
+        cp -f "$0" "$target" 2>/dev/null || true
+    fi
+    chmod +x "$target" 2>/dev/null || true
 }
 
 # -------------------------------------------------------------
@@ -1237,8 +1235,7 @@ update_self() {
         # 严格语法校验，避免更新到错误页面
         if bash -n "$tmp_file" &>/dev/null; then
             cp -f "$tmp_file" "$SCRIPT_INSTALL_PATH"
-            cp -f "$tmp_file" "$SCRIPT_ALT_PATH"
-            chmod +x "$SCRIPT_INSTALL_PATH" "$SCRIPT_ALT_PATH" 2>/dev/null || true
+            chmod +x "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
             rm -f "$tmp_file"
             echo -e "${GREEN}[✓] 管理脚本已成功更新至最新版！所有配置与节点完好保留。${PLAIN}"
             sleep 1
@@ -1421,7 +1418,7 @@ main() {
             restart) systemctl restart "${APP_NAME}" ;;
             status) systemctl status "${APP_NAME}" ;;
             log) journalctl -u "${APP_NAME}" -f -n 50 ;;
-            *) echo "用法: sb [add|modify|del|info|list|update|bbr|start|stop|restart|status|log]" ;;
+            *) echo "用法: sbox [add|modify|del|info|list|update|bbr|start|stop|restart|status|log]" ;;
         esac
     else
         # 初次安装若无节点，引导添加第一个节点
