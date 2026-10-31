@@ -16,7 +16,6 @@ PLAIN='\033[0m'
 
 # --- 核心路径与常量 ---
 APP_NAME="sing-box"
-BIN_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.json"
 NODES_FILE="${CONF_DIR}/nodes.json"
@@ -24,6 +23,10 @@ CERT_FILE="${CONF_DIR}/cert.crt"
 KEY_FILE="${CONF_DIR}/cert.key"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 SCRIPT_INSTALL_PATH="/usr/local/bin/sb"
+SCRIPT_ALT_PATH="/usr/local/bin/sing-box"
+CORE_BIN_DIR="${CONF_DIR}/bin"
+CORE_BIN="${CORE_BIN_DIR}/sing-box"
+BIN_PATH="${CORE_BIN}"
 
 # -------------------------------------------------------------
 # 0. 基础环境检测与依赖安装
@@ -252,9 +255,19 @@ sync_and_clean_inbounds() {
 
 download_singbox_core() {
     check_arch
+    mkdir -p "${CORE_BIN_DIR}"
     init_environment
 
-    if [[ -f "$BIN_PATH" ]]; then
+    # 优先检测 /etc/sing-box/bin/sing-box 是否已是真正的二进制核心 (ELF 格式)
+    if [[ -f "$CORE_BIN" ]] && head -c 4 "$CORE_BIN" 2>/dev/null | grep -q "ELF"; then
+        chmod +x "$CORE_BIN"
+        return
+    fi
+
+    # 如果 /usr/local/bin/sing-box 存在且是真实的 ELF 核心，直接复用
+    if [[ -f "/usr/local/bin/sing-box" ]] && head -c 4 "/usr/local/bin/sing-box" 2>/dev/null | grep -q "ELF"; then
+        cp -f "/usr/local/bin/sing-box" "$CORE_BIN"
+        chmod +x "$CORE_BIN"
         return
     fi
 
@@ -277,10 +290,10 @@ download_singbox_core() {
     wget -qO "$tmp_tar" "$proxy_url" || curl -fsSL "$proxy_url" -o "$tmp_tar"
     
     tar -zxvf "$tmp_tar" -C /tmp/ >/dev/null
-    cp -f "/tmp/sing-box-${version}-linux-${ARCH}/sing-box" "$BIN_PATH"
-    chmod +x "$BIN_PATH"
+    cp -f "/tmp/sing-box-${version}-linux-${ARCH}/sing-box" "$CORE_BIN"
+    chmod +x "$CORE_BIN"
     rm -rf "/tmp/sing-box"*
-    echo -e "${GREEN}[✓] sing-box 核心安装成功 -> ${BIN_PATH}${PLAIN}"
+    echo -e "${GREEN}[✓] sing-box 核心安装成功 -> ${CORE_BIN}${PLAIN}"
 
     # 初始化空白骨架配置
     if [[ ! -f "$CONF_FILE" ]]; then
@@ -414,6 +427,7 @@ auto_select_best_sni() {
     local candidate_domains=()
     if [[ -s "$json_cache" ]]; then
         while IFS= read -r line; do
+            line=$(echo "$line" | tr -d '\r\n[:space:]')
             [[ -n "$line" ]] && candidate_domains+=("$line")
         done < <(jq -r --arg c "$country" '.[] | select(.country == $c) | .domains[]?' "$json_cache" 2>/dev/null | sort -u)
     fi
@@ -461,7 +475,7 @@ auto_select_best_sni() {
     done
 
     if [[ -n "$best_sni" ]]; then
-        SELECTED_SNI="$best_sni"
+        SELECTED_SNI=$(echo "$best_sni" | tr -d '\r\n[:space:]')
         echo -e "${GREEN}[★] 高校优选成功！选用独立大学源站: \033[1;33m${SELECTED_SNI}\033[0;32m (本地延迟: ${min_latency} ms)${PLAIN}"
     else
         echo -e "${YELLOW}[!] 本地候选高校未能通过严苛体检，平滑降级启动 [大厂安全随机池]...${PLAIN}"
@@ -590,54 +604,55 @@ add_vless_reality() {
     local short_id
     short_id=$(openssl rand -hex 8)
 
+    # 清理所有变量防控制字符/换行符注入
+    port=$(echo "$port" | tr -d '\r\n[:space:]')
+    uuid=$(echo "$uuid" | tr -d '\r\n[:space:]')
+    private_key=$(echo "$private_key" | tr -d '\r\n[:space:]')
+    public_key=$(echo "$public_key" | tr -d '\r\n[:space:]')
+    short_id=$(echo "$short_id" | tr -d '\r\n[:space:]')
+    SELECTED_SNI=$(echo "$SELECTED_SNI" | tr -d '\r\n[:space:]')
+
     local tag="vless-reality-${port}"
-    local inbound_json=$(cat <<EOF
-{
-  "type": "vless",
-  "tag": "${tag}",
-  "listen": "::",
-  "listen_port": ${port},
-  "users": [
-    {
-      "uuid": "${uuid}",
-      "flow": "xtls-rprx-vision"
-    }
-  ],
-  "tls": {
-    "enabled": true,
-    "server_name": "${SELECTED_SNI}",
-    "reality": {
-      "enabled": true,
-      "handshake": {
-        "server": "${SELECTED_SNI}",
-        "server_port": 443
-      },
-      "private_key": "${private_key}",
-      "short_id": [
-        "${short_id}"
-      ]
-    }
-  }
-}
-EOF
-)
+    local inbound_json
+    inbound_json=$(jq -n \
+        --arg tag "$tag" \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --arg sni "$SELECTED_SNI" \
+        --arg priv "$private_key" \
+        --arg sid "$short_id" \
+        '{
+            type: "vless",
+            tag: $tag,
+            listen: "::",
+            listen_port: $port,
+            users: [{uuid: $uuid, flow: "xtls-rprx-vision"}],
+            tls: {
+                enabled: true,
+                server_name: $sni,
+                reality: {
+                    enabled: true,
+                    handshake: {server: $sni, server_port: 443},
+                    private_key: $priv,
+                    short_id: [$sid]
+                }
+            }
+        }')
 
     get_public_ip
     local share_link="vless://${uuid}@${VPS_IP}:${port}?security=reality&flow=xtls-rprx-vision&pbk=${public_key}&sni=${SELECTED_SNI}&sid=${short_id}&type=tcp&fp=chrome#Reality-${SELECTED_SNI}-${port}"
 
-    local node_meta=$(cat <<EOF
-{
-  "tag": "${tag}",
-  "type": "vless-reality",
-  "port": ${port},
-  "uuid": "${uuid}",
-  "sni": "${SELECTED_SNI}",
-  "public_key": "${public_key}",
-  "short_id": "${short_id}",
-  "link": "${share_link}"
-}
-EOF
-)
+    local node_meta
+    node_meta=$(jq -n \
+        --arg tag "$tag" \
+        --arg type "vless-reality" \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --arg sni "$SELECTED_SNI" \
+        --arg pbk "$public_key" \
+        --arg sid "$short_id" \
+        --arg link "$share_link" \
+        '{tag: $tag, type: $type, port: $port, uuid: $uuid, sni: $sni, public_key: $pbk, short_id: $sid, link: $link}')
 
     apply_inbound_config "$tag" "$inbound_json" "$node_meta"
 }
@@ -653,41 +668,42 @@ add_hysteria2() {
     password=$(openssl rand -hex 16)
     ensure_tls_cert
 
+    port=$(echo "$port" | tr -d '\r\n[:space:]')
+    password=$(echo "$password" | tr -d '\r\n[:space:]')
     local tag="hysteria2-${port}"
-    local inbound_json=$(cat <<EOF
-{
-  "type": "hysteria2",
-  "tag": "${tag}",
-  "listen": "::",
-  "listen_port": ${port},
-  "users": [
-    {
-      "password": "${password}"
-    }
-  ],
-  "tls": {
-    "enabled": true,
-    "certificate_path": "${CERT_FILE}",
-    "key_path": "${KEY_FILE}"
-  }
-}
-EOF
-)
+
+    local inbound_json
+    inbound_json=$(jq -n \
+        --arg tag "$tag" \
+        --argjson port "$port" \
+        --arg pwd "$password" \
+        --arg cert "$CERT_FILE" \
+        --arg key "$KEY_FILE" \
+        '{
+            type: "hysteria2",
+            tag: $tag,
+            listen: "::",
+            listen_port: $port,
+            users: [{password: $pwd}],
+            tls: {
+                enabled: true,
+                certificate_path: $cert,
+                key_path: $key
+            }
+        }')
 
     get_public_ip
     local share_link="hysteria2://${password}@${VPS_IP}:${port}?insecure=1&sni=bing.com#Hy2-${port}"
 
-    local node_meta=$(cat <<EOF
-{
-  "tag": "${tag}",
-  "type": "hysteria2",
-  "port": ${port},
-  "password": "${password}",
-  "sni": "bing.com",
-  "link": "${share_link}"
-}
-EOF
-)
+    local node_meta
+    node_meta=$(jq -n \
+        --arg tag "$tag" \
+        --arg type "hysteria2" \
+        --argjson port "$port" \
+        --arg pwd "$password" \
+        --arg sni "bing.com" \
+        --arg link "$share_link" \
+        '{tag: $tag, type: $type, port: $port, password: $pwd, sni: $sni, link: $link}')
 
     apply_inbound_config "$tag" "$inbound_json" "$node_meta"
 }
@@ -705,45 +721,47 @@ add_tuic() {
     password=$(openssl rand -hex 12)
     ensure_tls_cert
 
+    port=$(echo "$port" | tr -d '\r\n[:space:]')
+    uuid=$(echo "$uuid" | tr -d '\r\n[:space:]')
+    password=$(echo "$password" | tr -d '\r\n[:space:]')
     local tag="tuic-${port}"
-    local inbound_json=$(cat <<EOF
-{
-  "type": "tuic",
-  "tag": "${tag}",
-  "listen": "::",
-  "listen_port": ${port},
-  "users": [
-    {
-      "uuid": "${uuid}",
-      "password": "${password}"
-    }
-  ],
-  "congestion_control": "bbr",
-  "tls": {
-    "enabled": true,
-    "alpn": ["h3"],
-    "certificate_path": "${CERT_FILE}",
-    "key_path": "${KEY_FILE}"
-  }
-}
-EOF
-)
+
+    local inbound_json
+    inbound_json=$(jq -n \
+        --arg tag "$tag" \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --arg pwd "$password" \
+        --arg cert "$CERT_FILE" \
+        --arg key "$KEY_FILE" \
+        '{
+            type: "tuic",
+            tag: $tag,
+            listen: "::",
+            listen_port: $port,
+            users: [{uuid: $uuid, password: $pwd}],
+            congestion_control: "bbr",
+            tls: {
+                enabled: true,
+                server_name: "bing.com",
+                alpn: ["h3"],
+                certificate_path: $cert,
+                key_path: $key
+            }
+        }')
 
     get_public_ip
     local share_link="tuic://${uuid}:${password}@${VPS_IP}:${port}?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=bing.com#TUIC-${port}"
 
-    local node_meta=$(cat <<EOF
-{
-  "tag": "${tag}",
-  "type": "tuic",
-  "port": ${port},
-  "uuid": "${uuid}",
-  "password": "${password}",
-  "sni": "bing.com",
-  "link": "${share_link}"
-}
-EOF
-)
+    local node_meta
+    node_meta=$(jq -n \
+        --arg tag "$tag" \
+        --arg type "tuic" \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --arg pwd "$password" \
+        --arg link "$share_link" \
+        '{tag: $tag, type: $type, port: $port, uuid: $uuid, password: $pwd, link: $link}')
 
     apply_inbound_config "$tag" "$inbound_json" "$node_meta"
 }
@@ -759,43 +777,48 @@ add_shadowsocks() {
     local password
     password=$(openssl rand -base64 16)
 
+    port=$(echo "$port" | tr -d '\r\n[:space:]')
+    password=$(echo "$password" | tr -d '\r\n[:space:]')
     local tag="ss-${port}"
-    local inbound_json=$(cat <<EOF
-{
-  "type": "shadowsocks",
-  "tag": "${tag}",
-  "listen": "::",
-  "listen_port": ${port},
-  "network": "tcp,udp",
-  "method": "2022-blake3-aes-128-gcm",
-  "password": "${password}"
-}
-EOF
-)
+    local method="2022-blake3-aes-128-gcm"
+
+    local inbound_json
+    inbound_json=$(jq -n \
+        --arg tag "$tag" \
+        --argjson port "$port" \
+        --arg method "$method" \
+        --arg pwd "$password" \
+        '{
+            type: "shadowsocks",
+            tag: $tag,
+            listen: "::",
+            listen_port: $port,
+            network: "tcp,udp",
+            method: $method,
+            password: $pwd
+        }')
 
     get_public_ip
-    # Shadowsocks 2022 SIP002 格式: ss://base64(method:password)@ip:port#tag
     local creds
-    creds=$(echo -n "2022-blake3-aes-128-gcm:${password}" | base64 | tr -d '\n')
+    creds=$(echo -n "${method}:${password}" | base64 2>/dev/null | tr -d '\r\n')
     local share_link="ss://${creds}@${VPS_IP}:${port}#SS-${port}"
 
-    local node_meta=$(cat <<EOF
-{
-  "tag": "${tag}",
-  "type": "shadowsocks-2022",
-  "port": ${port},
-  "method": "2022-blake3-aes-128-gcm",
-  "password": "${password}",
-  "link": "${share_link}"
-}
-EOF
-)
+    local node_meta
+    node_meta=$(jq -n \
+        --arg tag "$tag" \
+        --arg type "shadowsocks-2022" \
+        --argjson port "$port" \
+        --arg method "$method" \
+        --arg pwd "$password" \
+        --arg link "$share_link" \
+        '{tag: $tag, type: $type, port: $port, method: $method, password: $pwd, link: $link}')
 
     apply_inbound_config "$tag" "$inbound_json" "$node_meta"
 }
 
 open_port() {
     local p="$1"
+    [[ -z "$p" ]] && return 0
     if command -v ufw &>/dev/null; then
         ufw allow "$p" >/dev/null 2>&1 || true
     fi
@@ -811,8 +834,6 @@ apply_inbound_config() {
     local inbound_json="$2"
     local node_meta="$3"
     local p=$(echo "$node_meta" | jq -r '.port')
-
-    init_environment
 
     echo -e "${CYAN}[+] 正在将入站规则写入核心配置...${PLAIN}"
     # 移除同名 tag 或相同端口的旧入站
@@ -1112,19 +1133,22 @@ enable_bbr() {
 # 7. 全局 CLI 快捷键注册
 # -------------------------------------------------------------
 install_cli_shortcut() {
-    if [[ ! -f "$0" || "$0" == /dev/fd/* || "$0" == /proc/* || "$0" == "bash" ]]; then
-        local github_raw="https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
-        local proxy_script="https://ghfast.top/https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
-        local cdn_script="https://cdn.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh"
-        curl -fsSL "$github_raw" -o "$SCRIPT_INSTALL_PATH" 2>/dev/null || \
-        curl -fsSL "$proxy_script" -o "$SCRIPT_INSTALL_PATH" 2>/dev/null || \
-        curl -fsSL "$cdn_script" -o "$SCRIPT_INSTALL_PATH" 2>/dev/null || \
-        wget -qO "$SCRIPT_INSTALL_PATH" "$github_raw" 2>/dev/null || \
-        wget -qO "$SCRIPT_INSTALL_PATH" "$proxy_script" 2>/dev/null || true
-    else
-        cp -f "$0" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
-    fi
-    chmod +x "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
+    local install_targets=("$SCRIPT_INSTALL_PATH" "$SCRIPT_ALT_PATH")
+    for target in "${install_targets[@]}"; do
+        if [[ ! -f "$0" || "$0" == /dev/fd/* || "$0" == /proc/* || "$0" == "bash" ]]; then
+            local github_raw="https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
+            local proxy_script="https://ghfast.top/https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh"
+            local cdn_script="https://cdn.jsdelivr.net/gh/shangusl/sing-box-boom@main/install.sh"
+            curl -fsSL "$github_raw" -o "$target" 2>/dev/null || \
+            curl -fsSL "$proxy_script" -o "$target" 2>/dev/null || \
+            curl -fsSL "$cdn_script" -o "$target" 2>/dev/null || \
+            wget -qO "$target" "$github_raw" 2>/dev/null || \
+            wget -qO "$target" "$proxy_script" 2>/dev/null || true
+        else
+            cp -f "$0" "$target" 2>/dev/null || true
+        fi
+        chmod +x "$target" 2>/dev/null || true
+    done
 }
 
 # -------------------------------------------------------------
@@ -1170,7 +1194,8 @@ update_self() {
         # 严格语法校验，避免更新到错误页面
         if bash -n "$tmp_file" &>/dev/null; then
             cp -f "$tmp_file" "$SCRIPT_INSTALL_PATH"
-            chmod +x "$SCRIPT_INSTALL_PATH"
+            cp -f "$tmp_file" "$SCRIPT_ALT_PATH"
+            chmod +x "$SCRIPT_INSTALL_PATH" "$SCRIPT_ALT_PATH" 2>/dev/null || true
             rm -f "$tmp_file"
             echo -e "${GREEN}[✓] 管理脚本已成功更新至最新版！所有配置与节点完好保留。${PLAIN}"
             sleep 1
