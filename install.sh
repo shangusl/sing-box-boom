@@ -115,17 +115,14 @@ sync_and_clean_inbounds() {
         local valid_tags
         valid_tags=$(jq -c '[.[].tag]' "$NODES_FILE" 2>/dev/null)
         if [[ -n "$valid_tags" && "$valid_tags" != "[]" ]]; then
+            # 展平所有可能被多重包装的数组，提取有效 tag 并按 listen_port 保证 1D 数组去重
             jq --argjson tags "$valid_tags" \
-               '.inbounds = [.inbounds[] | select(.tag as $t | $tags | index($t))]' \
+               '.inbounds = ([.inbounds | .. | select(type == "object" and has("tag") and has("listen_port")) | select(.tag as $t | $tags | index($t))] | reverse | unique_by(.listen_port) | reverse)' \
                "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
         fi
     else
         jq '.inbounds = []' "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
     fi
-
-    # 保证 listen_port 严格去重 (同一端口绝不允许多个 inbound 重叠绑定)
-    jq '.inbounds = ([.inbounds | reverse | unique_by(.listen_port) | reverse])' \
-       "$CONF_FILE" > "${CONF_FILE}.tmp" 2>/dev/null && mv "${CONF_FILE}.tmp" "$CONF_FILE"
 
     # 如果存在节点但服务未运行，自动清除孤儿进程并拉起服务
     if [[ "$count" -gt 0 ]] && ! systemctl is-active --quiet "${APP_NAME}" 2>/dev/null; then
