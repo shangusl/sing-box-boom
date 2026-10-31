@@ -19,7 +19,26 @@
 
 ---
 
-## 🚀 一键安装与管理命令
+## 🔍 独立神器：Reality SNI 智能雷达测速工具 (`sni-scout`)
+
+> 专为 VLESS-Reality 量身定制的 **“偷域名体检雷达”**。无需安装任何代理服务，单文件即开即用！
+> 智能分析 VPS 地理位置，自动排查 Cloudflare / Akamai 等边缘 CDN（杜绝借道白嫖），全方位实测 **TLS 1.3 / HTTP/2 握手支持与物理 RTT 延迟**，输出五星推荐榜单。
+
+**在任意 Linux VPS 上直接一键运行：**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/shangusl/sing-box-boom/main/sni-scout.sh)
+```
+
+**或者直接测试指定的域名：**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/shangusl/sing-box-boom/main/sni-scout.sh) test www.apple.com www.cityu.edu.hk
+```
+
+---
+
+## 🚀 一键安装与管理命令 (全协议套件)
 
 在你的 Linux VPS 上直接执行（GitHub 原生直链，秒级同步）：
 
