@@ -92,10 +92,12 @@ download_singbox_core() {
     echo -e "${GREEN}[✓] 选定版本: ${latest_tag} (${ARCH})${PLAIN}"
 
     local download_url="https://github.com/SagerNet/sing-box/releases/download/${latest_tag}/sing-box-${version}-linux-${ARCH}.tar.gz"
+    local proxy_url="https://ghfast.top/${download_url}"
     local tmp_tar="/tmp/sing-box.tar.gz"
     
     echo -e "${CYAN}[+] 正在下载核心二进制...${PLAIN}"
-    wget -qO "$tmp_tar" "$download_url" || curl -fsSL "$download_url" -o "$tmp_tar"
+    wget -qO "$tmp_tar" "$download_url" || curl -fsSL "$download_url" -o "$tmp_tar" || \
+    wget -qO "$tmp_tar" "$proxy_url" || curl -fsSL "$proxy_url" -o "$tmp_tar"
     
     tar -zxvf "$tmp_tar" -C /tmp/ >/dev/null
     cp -f "/tmp/sing-box-${version}-linux-${ARCH}/sing-box" "$BIN_PATH"
@@ -375,9 +377,16 @@ generate_config_and_service() {
     local keypair
     keypair=$("${BIN_PATH}" generate reality-keypair)
     local private_key
-    private_key=$(echo "$keypair" | grep -i "Private key" | awk '{print $NF}')
+    private_key=$(echo "$keypair" | grep -iE "PrivateKey|Private key" | head -n 1 | sed 's/.*:[[:space:]]*//' | tr -d ' "\r\n')
     local public_key
-    public_key=$(echo "$keypair" | grep -i "Public key" | awk '{print $NF}')
+    public_key=$(echo "$keypair" | grep -iE "PublicKey|Public key" | head -n 1 | sed 's/.*:[[:space:]]*//' | tr -d ' "\r\n')
+
+    # 双重保险保底
+    if [[ -z "$private_key" || -z "$public_key" ]]; then
+        local tmp_keys=($(echo "$keypair" | sed 's/.*://'))
+        private_key=$(echo "${tmp_keys[0]}" | tr -d ' "\r\n')
+        public_key=$(echo "${tmp_keys[1]}" | tr -d ' "\r\n')
+    fi
 
     local short_id
     short_id=$(openssl rand -hex 8)

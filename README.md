@@ -23,7 +23,7 @@
 在你的 Linux VPS (Debian / Ubuntu / CentOS / AlmaLinux / Alpine) 执行以下命令：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<你的GitHub用户名>/<你的仓库名>/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/shangusl/sing-box-boom/main/install.sh)
 ```
 
 > **提示**：安装完成后，随时可以在终端直接输入 `sb` 唤出交互式管理菜单。
