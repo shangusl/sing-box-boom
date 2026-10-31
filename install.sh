@@ -370,6 +370,47 @@ pick_safe_bigtech_sni() {
     fi
 }
 
+choose_sni_workflow() {
+    echo -e "\n--------------------------------------------------------"
+    echo -e " 请选择伪装域名 (SNI) 匹配策略:"
+    echo -e " ${GREEN}1.${PLAIN} \033[1;32m智能优选当地独立高校\033[0m (推荐: 极客防封, 自动排查CDN与白嫖风险, 失败自动降级大厂)"
+    echo -e " ${GREEN}2.${PLAIN} \033[1;36m精选大厂安全随机\033[0m     (彻底剔除 Cloudflare, 快速稳妥)"
+    echo -e " ${GREEN}3.${PLAIN} 自定义输入域名"
+    echo -e "--------------------------------------------------------"
+    read -rp "请输入选项 [1-3, 默认 1]: " sni_opt
+    sni_opt=${sni_opt:-1}
+
+    case "$sni_opt" in
+        1) auto_select_best_sni ;;
+        2) pick_safe_bigtech_sni ;;
+        3)
+            while true; do
+                read -rp "请输入你想伪装的合法域名 (例如 www.apple.com): " custom_domain
+                if [[ -z "$custom_domain" ]]; then
+                    echo -e "${RED}域名不能为空！${PLAIN}"
+                    continue
+                fi
+                echo -e "${CYAN}[+] 正在体检该域名的 TLS 1.3 / HTTP/2 连通性...${PLAIN}"
+                local lat
+                lat=$(check_candidate_quality "$custom_domain" 2>/dev/null || true)
+                if [[ -n "$lat" && "$lat" != "0" ]]; then
+                    echo -e "${GREEN}[✓] 域名校验通过！(握手延迟: ${lat} ms)${PLAIN}"
+                    SELECTED_SNI="$custom_domain"
+                    break
+                else
+                    echo -e "${YELLOW}[警告] 目标域名不支持 TLS 1.3 / HTTP/2 或无法访问！${PLAIN}"
+                    read -rp "确定仍要强行使用吗？[y/N]: " force_use
+                    if [[ "$force_use" =~ ^[Yy]$ ]]; then
+                        SELECTED_SNI="$custom_domain"
+                        break
+                    fi
+                fi
+            done
+            ;;
+        *) auto_select_best_sni ;;
+    esac
+}
+
 # -------------------------------------------------------------
 # 3. 协议配置生成器 (四大核心协议)
 # -------------------------------------------------------------
@@ -381,7 +422,7 @@ add_vless_reality() {
     read -rp "请输入监听端口 [默认: ${default_port}]: " port
     port=${port:-$default_port}
 
-    auto_select_best_sni
+    choose_sni_workflow
 
     local uuid
     uuid=$("${BIN_PATH}" generate uuid)
@@ -639,7 +680,146 @@ apply_inbound_config() {
 }
 
 # -------------------------------------------------------------
-# 4. 节点删除与列表管理
+# 4. 节点修改与维护
+# -------------------------------------------------------------
+modify_node() {
+    local count
+    count=$(jq 'length' "$NODES_FILE" 2>/dev/null || echo 0)
+    if [[ "$count" -eq 0 ]]; then
+        echo -e "${YELLOW}[!] 当前未配置任何节点，无法修改！${PLAIN}"
+        return
+    fi
+
+    echo -e "\n${CYAN}请选择要修改的节点编号:${PLAIN}"
+    jq -r 'to_entries[] | "  [\(.key + 1)] \(.value.type) (端口: \(.value.port) | tag: \(.value.tag))"' "$NODES_FILE"
+    echo -e "  [0] 返回上一级"
+    read -rp "请输入选项 [0-${count}]: " idx
+
+    [[ "$idx" == "0" ]] && return
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > count )); then
+        echo -e "${RED}[错误] 无效的编号！${PLAIN}"
+        return
+    fi
+
+    local real_idx=$((idx - 1))
+    local target_tag
+    target_tag=$(jq -r --argjson i "$real_idx" '.[$i].tag' "$NODES_FILE")
+    local node_type
+    node_type=$(jq -r --argjson i "$real_idx" '.[$i].type' "$NODES_FILE")
+    local current_port
+    current_port=$(jq -r --argjson i "$real_idx" '.[$i].port' "$NODES_FILE")
+
+    echo -e "\n--------------------------------------------------------"
+    echo -e " 正在修改节点: \033[1;33m${target_tag}\033[0m (${node_type})"
+    echo -e " ${GREEN}1.${PLAIN} 修改监听端口 (当前: ${current_port})"
+    if [[ "$node_type" == "vless-reality" ]]; then
+        local current_sni=$(jq -r --argjson i "$real_idx" '.[$i].sni' "$NODES_FILE")
+        echo -e " ${GREEN}2.${PLAIN} 更换伪装域名 SNI (当前: ${current_sni})"
+        echo -e " ${GREEN}3.${PLAIN} 刷新/重新生成 UUID"
+    elif [[ "$node_type" == "hysteria2" || "$node_type" == "tuic" ]]; then
+        echo -e " ${GREEN}2.${PLAIN} 刷新/重新生成认证密码"
+    elif [[ "$node_type" == "shadowsocks-2022" ]]; then
+        echo -e " ${GREEN}2.${PLAIN} 刷新/重新生成 2022 密钥"
+    fi
+    echo -e " ${GREEN}0.${PLAIN} 返回上一级"
+    echo -e "--------------------------------------------------------"
+    read -rp "请选择修改项: " m_opt
+
+    case "$m_opt" in
+        1)
+            read -rp "请输入新端口号 (1-65535): " new_p
+            if [[ "$new_p" -gt 0 && "$new_p" -le 65535 ]]; then
+                jq --arg t "$target_tag" --argjson p "$new_p" '(.inbounds[] | select(.tag == $t)).listen_port = $p' "$CONF_FILE" > "${CONF_FILE}.tmp" && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+                get_public_ip
+                local old_link
+                old_link=$(jq -r --arg t "$target_tag" '.[] | select(.tag == $t) | .link' "$NODES_FILE")
+                local new_link
+                new_link=$(echo "$old_link" | sed -E "s/:${current_port}(\/|\?|#)/:${new_p}\1/")
+                jq --arg t "$target_tag" --argjson p "$new_p" --arg l "$new_link" '(.[] | select(.tag == $t)).port = $p | (.[] | select(.tag == $t)).link = $l' "$NODES_FILE" > "${NODES_FILE}.tmp" && mv "${NODES_FILE}.tmp" "$NODES_FILE"
+
+                if "$BIN_PATH" check -c "$CONF_FILE"; then
+                    systemctl restart "${APP_NAME}"
+                    echo -e "${GREEN}[✓] 端口已成功修改为: ${new_p}${PLAIN}"
+                    print_single_node "$target_tag"
+                else
+                    echo -e "${RED}[错误] 配置校验失败，已放弃修改！${PLAIN}"
+                fi
+            else
+                echo -e "${RED}端口无效！${PLAIN}"
+            fi
+            ;;
+        2)
+            if [[ "$node_type" == "vless-reality" ]]; then
+                choose_sni_workflow
+                jq --arg t "$target_tag" --arg s "$SELECTED_SNI" '(.inbounds[] | select(.tag == $t)).tls.server_name = $s | (.inbounds[] | select(.tag == $t)).tls.reality.handshake.server = $s' "$CONF_FILE" > "${CONF_FILE}.tmp" && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+                local uuid pbk sid port
+                uuid=$(jq -r --arg t "$target_tag" '.[] | select(.tag == $t) | .uuid' "$NODES_FILE")
+                pbk=$(jq -r --arg t "$target_tag" '.[] | select(.tag == $t) | .public_key' "$NODES_FILE")
+                sid=$(jq -r --arg t "$target_tag" '.[] | select(.tag == $t) | .short_id' "$NODES_FILE")
+                port=$(jq -r --arg t "$target_tag" '.[] | select(.tag == $t) | .port' "$NODES_FILE")
+                get_public_ip
+                local new_link="vless://${uuid}@${VPS_IP}:${port}?security=reality&flow=xtls-rprx-vision&pbk=${pbk}&sni=${SELECTED_SNI}&sid=${sid}&type=tcp&fp=chrome#Reality-${SELECTED_SNI}-${port}"
+                jq --arg t "$target_tag" --arg s "$SELECTED_SNI" --arg l "$new_link" '(.[] | select(.tag == $t)).sni = $s | (.[] | select(.tag == $t)).link = $l' "$NODES_FILE" > "${NODES_FILE}.tmp" && mv "${NODES_FILE}.tmp" "$NODES_FILE"
+
+                systemctl restart "${APP_NAME}"
+                echo -e "${GREEN}[✓] 伪装域名 SNI 已成功更换为: ${SELECTED_SNI}${PLAIN}"
+                print_single_node "$target_tag"
+            elif [[ "$node_type" == "hysteria2" ]]; then
+                local new_pwd=$(openssl rand -hex 16)
+                jq --arg t "$target_tag" --arg p "$new_pwd" '(.inbounds[] | select(.tag == $t)).users[0].password = $p' "$CONF_FILE" > "${CONF_FILE}.tmp" && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+                get_public_ip
+                local new_link="hysteria2://${new_pwd}@${VPS_IP}:${current_port}?insecure=1&sni=bing.com#Hy2-${current_port}"
+                jq --arg t "$target_tag" --arg p "$new_pwd" --arg l "$new_link" '(.[] | select(.tag == $t)).password = $p | (.[] | select(.tag == $t)).link = $l' "$NODES_FILE" > "${NODES_FILE}.tmp" && mv "${NODES_FILE}.tmp" "$NODES_FILE"
+                systemctl restart "${APP_NAME}"
+                echo -e "${GREEN}[✓] Hysteria 2 认证密码已更新！${PLAIN}"
+                print_single_node "$target_tag"
+            elif [[ "$node_type" == "tuic" ]]; then
+                local new_pwd=$(openssl rand -hex 12)
+                jq --arg t "$target_tag" --arg p "$new_pwd" '(.inbounds[] | select(.tag == $t)).users[0].password = $p' "$CONF_FILE" > "${CONF_FILE}.tmp" && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+                local uuid=$(jq -r --arg t "$target_tag" '.[] | select(.tag == $t) | .uuid' "$NODES_FILE")
+                get_public_ip
+                local new_link="tuic://${uuid}:${new_pwd}@${VPS_IP}:${current_port}?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=bing.com#TUIC-${current_port}"
+                jq --arg t "$target_tag" --arg p "$new_pwd" --arg l "$new_link" '(.[] | select(.tag == $t)).password = $p | (.[] | select(.tag == $t)).link = $l' "$NODES_FILE" > "${NODES_FILE}.tmp" && mv "${NODES_FILE}.tmp" "$NODES_FILE"
+                systemctl restart "${APP_NAME}"
+                echo -e "${GREEN}[✓] TUIC 密码已更新！${PLAIN}"
+                print_single_node "$target_tag"
+            elif [[ "$node_type" == "shadowsocks-2022" ]]; then
+                local new_pwd=$(openssl rand -base64 16)
+                jq --arg t "$target_tag" --arg p "$new_pwd" '(.inbounds[] | select(.tag == $t)).password = $p' "$CONF_FILE" > "${CONF_FILE}.tmp" && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+                get_public_ip
+                local creds=$(echo -n "2022-blake3-aes-128-gcm:${new_pwd}" | base64 | tr -d '\n')
+                local new_link="ss://${creds}@${VPS_IP}:${current_port}#SS-${current_port}"
+                jq --arg t "$target_tag" --arg p "$new_pwd" --arg l "$new_link" '(.[] | select(.tag == $t)).password = $p | (.[] | select(.tag == $t)).link = $l' "$NODES_FILE" > "${NODES_FILE}.tmp" && mv "${NODES_FILE}.tmp" "$NODES_FILE"
+                systemctl restart "${APP_NAME}"
+                echo -e "${GREEN}[✓] Shadowsocks 2022 密钥已更新！${PLAIN}"
+                print_single_node "$target_tag"
+            fi
+            ;;
+        3)
+            if [[ "$node_type" == "vless-reality" ]]; then
+                local new_uuid
+                new_uuid=$("${BIN_PATH}" generate uuid)
+                jq --arg t "$target_tag" --arg u "$new_uuid" '(.inbounds[] | select(.tag == $t)).users[0].uuid = $u' "$CONF_FILE" > "${CONF_FILE}.tmp" && mv "${CONF_FILE}.tmp" "$CONF_FILE"
+                local pbk sid port sni
+                pbk=$(jq -r --arg t "$target_tag" '.[] | select(.tag == $t) | .public_key' "$NODES_FILE")
+                sid=$(jq -r --arg t "$target_tag" '.[] | select(.tag == $t) | .short_id' "$NODES_FILE")
+                port=$(jq -r --arg t "$target_tag" '.[] | select(.tag == $t) | .port' "$NODES_FILE")
+                sni=$(jq -r --arg t "$target_tag" '.[] | select(.tag == $t) | .sni' "$NODES_FILE")
+                get_public_ip
+                local new_link="vless://${new_uuid}@${VPS_IP}:${port}?security=reality&flow=xtls-rprx-vision&pbk=${pbk}&sni=${sni}&sid=${sid}&type=tcp&fp=chrome#Reality-${sni}-${port}"
+                jq --arg t "$target_tag" --arg u "$new_uuid" --arg l "$new_link" '(.[] | select(.tag == $t)).uuid = $u | (.[] | select(.tag == $t)).link = $l' "$NODES_FILE" > "${NODES_FILE}.tmp" && mv "${NODES_FILE}.tmp" "$NODES_FILE"
+                systemctl restart "${APP_NAME}"
+                echo -e "${GREEN}[✓] UUID 已成功更新为: ${new_uuid}${PLAIN}"
+                print_single_node "$target_tag"
+            fi
+            ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项！${PLAIN}" ;;
+    esac
+}
+
+# -------------------------------------------------------------
+# 5. 节点删除与列表管理
 # -------------------------------------------------------------
 delete_node() {
     local count
@@ -830,28 +1010,30 @@ show_menu() {
 
     echo -e "--------------------------------------------------------"
     echo -e " ${GREEN}1.${PLAIN} 添加新节点 (VLESS-Reality / Hysteria2 / TUIC / SS)"
-    echo -e " ${GREEN}2.${PLAIN} 删除现有节点"
-    echo -e " ${GREEN}3.${PLAIN} 查看所有节点连接信息 & 二维码"
-    echo -e " ${GREEN}4.${PLAIN} 一键开启系统 BBR 拥塞控制加速"
-    echo -e " ${GREEN}5.${PLAIN} 启动服务"
-    echo -e " ${GREEN}6.${PLAIN} 停止服务"
-    echo -e " ${GREEN}7.${PLAIN} 重启服务"
-    echo -e " ${GREEN}8.${PLAIN} 查看实时运行日志 (tail -f)"
-    echo -e " ${GREEN}9.${PLAIN} 彻底卸载 sing-box"
+    echo -e " ${GREEN}2.${PLAIN} 修改现有节点 (修改端口 / 更换SNI / 刷新凭据)"
+    echo -e " ${GREEN}3.${PLAIN} 删除现有节点"
+    echo -e " ${GREEN}4.${PLAIN} 查看所有节点连接信息 & 二维码"
+    echo -e " ${GREEN}5.${PLAIN} 一键开启系统 BBR 拥塞控制加速"
+    echo -e " ${GREEN}6.${PLAIN} 启动服务"
+    echo -e " ${GREEN}7.${PLAIN} 停止服务"
+    echo -e " ${GREEN}8.${PLAIN} 重启服务"
+    echo -e " ${GREEN}9.${PLAIN} 查看实时运行日志 (tail -f)"
+    echo -e " ${GREEN}10.${PLAIN} 彻底卸载 sing-box"
     echo -e " ${GREEN}0.${PLAIN} 退出管理"
     echo -e "========================================================"
-    read -rp "请输入选项 [0-9]: " opt
+    read -rp "请输入选项 [0-10]: " opt
 
     case "$opt" in
         1) menu_add_node ;;
-        2) delete_node ;;
-        3) show_all_nodes ;;
-        4) enable_bbr ;;
-        5) systemctl start "${APP_NAME}" && echo -e "${GREEN}服务已启动！${PLAIN}" ;;
-        6) systemctl stop "${APP_NAME}" && echo -e "${YELLOW}服务已停止！${PLAIN}" ;;
-        7) systemctl restart "${APP_NAME}" && echo -e "${GREEN}服务已重启！${PLAIN}" ;;
-        8) journalctl -u "${APP_NAME}" -f -n 50 ;;
-        9)
+        2) modify_node ;;
+        3) delete_node ;;
+        4) show_all_nodes ;;
+        5) enable_bbr ;;
+        6) systemctl start "${APP_NAME}" && echo -e "${GREEN}服务已启动！${PLAIN}" ;;
+        7) systemctl stop "${APP_NAME}" && echo -e "${YELLOW}服务已停止！${PLAIN}" ;;
+        8) systemctl restart "${APP_NAME}" && echo -e "${GREEN}服务已重启！${PLAIN}" ;;
+        9) journalctl -u "${APP_NAME}" -f -n 50 ;;
+        10)
             systemctl stop "${APP_NAME}" 2>/dev/null || true
             systemctl disable "${APP_NAME}" 2>/dev/null || true
             rm -rf "${CONF_DIR}" "${SERVICE_FILE}" "${BIN_PATH}" "${SCRIPT_INSTALL_PATH}"
@@ -880,6 +1062,7 @@ main() {
     if [[ $# -gt 0 ]]; then
         case "$1" in
             add) menu_add_node ;;
+            modify|change) modify_node ;;
             del) delete_node ;;
             info|list) show_all_nodes ;;
             bbr) enable_bbr ;;
@@ -888,7 +1071,7 @@ main() {
             restart) systemctl restart "${APP_NAME}" ;;
             status) systemctl status "${APP_NAME}" ;;
             log) journalctl -u "${APP_NAME}" -f -n 50 ;;
-            *) echo "用法: sb [add|del|info|list|bbr|start|stop|restart|status|log]" ;;
+            *) echo "用法: sb [add|modify|del|info|list|bbr|start|stop|restart|status|log]" ;;
         esac
     else
         # 初次安装若无节点，引导添加第一个节点
